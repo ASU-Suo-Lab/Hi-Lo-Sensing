@@ -1,0 +1,4 @@
+python -u carla_train_eval.py --data_root='./data/processed/3lidar=low_3radar=high/fused' --device=4 --fusion='feature' --log_name='feature_5frame_res' --n_frame=5 --res
+python -u carla_train_eval.py --data_root='./data/processed/3lidar=low_3radar=low/fused' --device=4 --fusion='feature' --log_name='feature_5frame_res' --n_frame=5 --res
+python -u carla_train_eval.py --data_root='./data/processed/2lidar=high_4radar=high/fused' --device=4 --fusion='feature' --log_name='feature_5frame_res' --n_frame=5 --res
+python -u carla_train_eval.py --data_root='./data/processed/2lidar=high_4radar=low/fused' --device=4 --fusion='feature' --log_name='feature_5frame_res' --n_frame=5 --res

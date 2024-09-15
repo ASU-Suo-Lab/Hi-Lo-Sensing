@@ -1,0 +1,1 @@
+python -u carla_train_eval.py --device=5 --fusion='feature' --log_name='feature_5frame_nnres_sepenc' --n_frame=5 --res --nn_res --separate_encoder
