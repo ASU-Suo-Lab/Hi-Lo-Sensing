@@ -20,7 +20,7 @@ This paper introduces a sensor placement algorithm to manage uncertainties in se
 
 ## ResFusionNet for 3D Object Detection
 
-This repository contains the official source code for the research paper [High and Low Resolution Tradeoffs in Roadside Multimodal Sensing]().
+This paper proposes Residual Fusion Net (ResFusionNet) to fuse multimodal data for 3D object detection, which enables a quantifiable tradeoffbetween spatial resolution and information richness across different modalities.
 
 <details>
 <summary>ResFusionNet Details</summary>
