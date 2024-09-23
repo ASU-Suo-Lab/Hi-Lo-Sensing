@@ -7,3 +7,6 @@
 <!-- - [Citation](#citation) -->
 
 ## Introduction
+High and Low Resolution Tradeoffs in Roadside Multimodal Sensing: We underscore the potential of using low spatial resolution but information-rich sensors to enhance detection capabilities for vulnerable road users while highlighting the necessity of thoroughly evaluating sensor modality heterogeneity, traffic participant diversity, and operational uncertainties when making sensor tradeoffs in practical applications.
+
+https://github.com/ASU-Suo-Lab/Hi-Lo-Sensing/blob/main/resource/ICRA0921.mp4
