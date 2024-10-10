@@ -1,4 +1,4 @@
-# Hi-Lo-Sensing
+# High and Low Resolution Tradeoffs in Roadside Multimodal Sensing
 ## Content
 <!-- - [News](#news-fire) -->
 - [Introduction](#Introduction)
