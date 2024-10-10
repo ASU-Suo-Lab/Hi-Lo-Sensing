@@ -3,6 +3,7 @@
 <!-- - [News](#news-fire) -->
 - [Introduction](#Introduction)
 - [Multimodal Sensor Deployment under Uncertainties](#Multimodal-Sensor-Deployment-under-Uncertainties)
+- [Dataset Download](#Dataset-download)
 - [ResFusionNet for 3D Object Detection](#ResFusionNet-for-3D-Object-Detection)
 <!-- - [Citation](#citation) -->
 
@@ -17,6 +18,10 @@ High and Low Resolution Tradeoffs in Roadside Multimodal Sensing: This paper und
 This paper introduces a sensor placement algorithm to manage uncertainties in sensor visibility influenced by environmental or human-related factors.
 
 (code will be release soon)
+
+## Dataset Download
+
+Please click on this [link](https://drive.google.com/drive/folders/1Hr_VLnZNa5CrmdpOtwqxZSNFjEr8_N7x?usp=sharing) to download the data.
 
 ## ResFusionNet for 3D Object Detection
 
