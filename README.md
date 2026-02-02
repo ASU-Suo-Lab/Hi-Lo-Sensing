@@ -10,8 +10,8 @@ This repo is the official implementation of our paper: On the Resolution–Perfo
 
 
 ## Overview
-- [🤔 Introduction](https://github.com/ASU-Suo-Lab/Hi-Lo-Sensing#introduction)
-- [🛠️ Quick Start](https://github.com/ASU-Suo-Lab/Hi-Lo-Sensing#quick-start)
+- [🤔 Introduction](#introduction)
+- [🛠️ Quick Start](#quick-start)
 
 
 ## Introduction
