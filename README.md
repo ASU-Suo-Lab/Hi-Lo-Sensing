@@ -30,7 +30,7 @@ We construct a multi-modal, multi-resolution roadside perception dataset in the 
 Please follow [OpenPCDet's official instructions](https://github.com/open-mmlab/OpenPCDet/blob/master/docs/INSTALL.md) to set up the environment first.
 
 ### Dataset Preparation
-* Please download our multimodal, multi-resolution dataset, which is divided into three subsets based on resolution: [low-resolution dataset](https://www.dropbox.com/scl/fi/mo084bo79y2a8non8el7p/2025-10-01_22-32-44-low-2radar.zip?rlkey=n9301maba47wwgggifnmmkfb8&st=jg1n77it&dl=0), [medium-resolution dataset](https://www.dropbox.com/scl/fi/ubol0sdci07ehxnd1s5es/2025-10-02_09-12-13-mid-2radar.zip?rlkey=wwmhczc16v07f1gwqkx4cwgce&st=nnavvssp&dl=0), and [high-resolution dataset](https://www.dropbox.com/scl/fi/5150dt742otnotzl5z08k/2025-10-02_13-09-29-high-2radar.zip?rlkey=xgydc7ibp8k6ulg6k3mjj717g&st=vjm6aldz&dl=0).
+* Please download our multimodal, multi-resolution dataset, which is divided into three subsets based on resolution: [low-resolution dataset](https://www.dropbox.com/scl/fi/71p8cnrgohstvcxk8g7o9/low_lidar_2radar.zip?rlkey=j9jc8pdln9mzie0mvaawdc52i&st=3odmdk4p&dl=0), [medium-resolution dataset](https://www.dropbox.com/scl/fi/jddck41d8ukkzng2f6r3y/mid_lidar_2radar.zip?rlkey=38k5p5pqrhkvssfdktobd1xro&st=c1oq00au&dl=0), and [high-resolution dataset](https://www.dropbox.com/scl/fi/2gxxdz31tfajhcp6a0nky/high_lidar_2radar.zip?rlkey=svy4zmg2onjir4g4gojyu87qm&st=wmigap1a&dl=0).
 
 * After extracting the files, please organize the downloaded files as follows:
 ```
