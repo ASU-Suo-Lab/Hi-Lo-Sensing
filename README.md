@@ -26,3 +26,66 @@ We construct a multi-modal, multi-resolution roadside perception dataset in the 
 </div>
 
 ## Quick Start
+### Installation
+Please follow [OpenPCDet's official instructions](https://github.com/open-mmlab/OpenPCDet/blob/master/docs/INSTALL.md) to set up the environment first.
+
+### Dataset Preparation
+* Please download our multimodal, multi-resolution dataset, which is divided into three subsets based on resolution: [low-resolution dataset](https://www.dropbox.com/scl/fi/mo084bo79y2a8non8el7p/2025-10-01_22-32-44-low-2radar.zip?rlkey=n9301maba47wwgggifnmmkfb8&st=jg1n77it&dl=0), [medium-resolution dataset](https://www.dropbox.com/scl/fi/ubol0sdci07ehxnd1s5es/2025-10-02_09-12-13-mid-2radar.zip?rlkey=wwmhczc16v07f1gwqkx4cwgce&st=nnavvssp&dl=0), and [high-resolution dataset](https://www.dropbox.com/scl/fi/5150dt742otnotzl5z08k/2025-10-02_13-09-29-high-2radar.zip?rlkey=xgydc7ibp8k6ulg6k3mjj717g&st=vjm6aldz&dl=0).
+
+* After the preprocessing is complete, please organize the downloaded files as follows:
+```
+OpenPCDet
+├── data
+│   ├── low_lidar_2radar
+│   │   │── v1.0-trainval
+│   │   │   │── lidar_fusion
+│   │   │   │── radar_fusion
+│   │   │   │── label
+│   │   │   │── ......
+│   ├── mid_lidar_2radar
+│   │   │── v1.0-trainval
+│   │   │   │── lidar_fusion
+│   │   │   │── radar_fusion
+│   │   │   │── label
+│   │   │   │── ......
+│   ├── high_lidar_2radar
+│   │   │── v1.0-trainval
+│   │   │   │── lidar_fusion
+│   │   │   │── radar_fusion
+│   │   │   │── label
+│   │   │   │── ......
+├── pcdet
+├── tools
+```
+
+* Generate the data infos by running the following command:
+
+```python 
+# Create dataset info file, lidar and image gt database
+python -m pcdet.datasets.nuscenes.nuscenes_dataset --func create_nuscenes_infos \
+    --cfg_file tools/cfgs/dataset_configs/nuscenes_dataset.yaml \
+    --version v1.0-trainval \
+    --with_cam \
+    --with_cam_gt \
+``` 
+
+* The final format of the generated data is as follows:
+```
+OpenPCDet
+├── data
+│   ├── nuscenes
+│   │   │── v1.0-trainval (or v1.0-mini if you use mini)
+│   │   │   │── samples
+│   │   │   │── sweeps
+│   │   │   │── maps
+│   │   │   │── v1.0-trainval  
+│   │   │   │── img_gt_database_10sweeps_withvelo
+│   │   │   │── gt_database_10sweeps_withvelo
+│   │   │   │── nuscenes_10sweeps_withvelo_lidar.npy (optional) # if open share mem
+│   │   │   │── nuscenes_10sweeps_withvelo_img.npy (optional) # if open share mem
+│   │   │   │── nuscenes_infos_10sweeps_train.pkl  
+│   │   │   │── nuscenes_infos_10sweeps_val.pkl
+│   │   │   │── nuscenes_dbinfos_10sweeps_withvelo.pkl
+├── pcdet
+├── tools
+```
