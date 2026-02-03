@@ -15,7 +15,7 @@ This repo is the official implementation of our paper: On the Resolution–Perfo
 
 
 ## Introduction
-Through systematic model architecture exploration, this paper demonstrates that fusing information-rich 4D mmWave radar with low-resolution LiDAR point clouds can enrich learned feature representations and outperform a high-resolution LiDAR-only baseline in detecting diverse traffic participants. Through extensive ablation studies and experimental evaluation, we demonstrate that the optimal proposed fusion model integrating 4D radar with low-resolution LiDAR achieves object detection accuracy close to a mid-resolution LiDAR-only solution. Furthermore, the fusion of 4D radar and mid-resolution LiDAR even outperforms the solution using high-resolution LiDAR only by `+0.8\%`. 
+Through systematic model architecture exploration, this paper demonstrates that fusing information-rich 4D mmWave radar with low-resolution LiDAR point clouds can enrich learned feature representations and outperform a high-resolution LiDAR-only baseline in detecting diverse traffic participants. Through extensive ablation studies and experimental evaluation, we demonstrate that the optimal proposed fusion model integrating 4D radar with low-resolution LiDAR achieves object detection accuracy close to a mid-resolution LiDAR-only solution. Furthermore, the fusion of 4D radar and mid-resolution LiDAR even outperforms the solution using high-resolution LiDAR only by `+0.8%`. 
 <div align="center">
   <img src="assets/general fusion framework.jpg" width="100%"/>
 </div>
@@ -23,6 +23,11 @@ Through systematic model architecture exploration, this paper demonstrates that 
 We construct a multi-modal, multi-resolution roadside perception dataset in the [CARLA](https://github.com/carla-simulator/carla) simulation environment. To the best of our knowledge, this dataset is the first large-scale roadside perception benchmark dataset combining multi-resolution and multimodal sensors, enabling fair and controlled comparisons of various multimodal fusion strategies.
 <div align="center">
   <img src="assets/digital map.jpg" width="100%"/>
+</div>
+
+What's more, to improve the fidelity of the simulation platform in capturing the distribution of point-cloud data from traffic participants, particularly for mmWave radar sensing, we develop a lightweight multimodal roadside sensing platform and deploy it on a private roadway to collect real-world multimodal data. These realistic measurements are used to fine-tune the radar module within the simulation environment, while maintaining sensor configurations identical to those used on the physical platform.
+<div align="center">
+  <img src="assets/Lidar_radar_work_principle.jpg" width="100%"/>
 </div>
 
 ## Quick Start
