@@ -118,7 +118,7 @@ MODEL:
         USE_CONV_FOR_NO_STRIDE: True
     
     FUSER:
-        NAME: LRMSDeformAttnFuser1 
+        NAME: LRMSDeformAttnFuser
         IN_CHANNEL: [512, 512] 
         OUT_CHANNEL: [256, 256] 
         BEV_MAP_SIZE: 112

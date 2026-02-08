@@ -142,7 +142,7 @@ MODEL:
         NUM_UPSAMPLE_FILTERS: [ 128, 128, 128 ]
 
     FUSER:
-        NAME: LRMSDeformAttnFuser1 
+        NAME: LRMSDeformAttnFuser
         IN_CHANNEL: [384, 384] 
         OUT_CHANNEL: [256, 256] 
         BEV_MAP_SIZE: 152

@@ -1,12 +1,15 @@
 from .convfuser import ConvFuser,LRConvFuser
-from .lr_msdeformattn_fuser import LRMSDeformAttnFuser,LRMSDeformAttnFuser1
+from .msdeformattn_bi_query import LRMSDeformAttnFuser
+from .msdeformattn_lidar_query import LRMSDeformAttnFuser_LiDAR
+from .msdeformattn_radar_query import LRMSDeformAttnFuser_Radar
 from .l4dr_fuser import L4DRFusion
 from .lrfusion_fuser import LRFusion
 __all__ = {
     'ConvFuser':ConvFuser,
     'LRMSDeformAttnFuser': LRMSDeformAttnFuser,
     'LRConvFuser':LRConvFuser,
-    'LRMSDeformAttnFuser1': LRMSDeformAttnFuser1,
+    'LRMSDeformAttnFuser_LiDAR': LRMSDeformAttnFuser_LiDAR,
+    'LRMSDeformAttnFuser_Radar': LRMSDeformAttnFuser_Radar,
     'L4DRFusion': L4DRFusion,
     'LRFusion': LRFusion
 }
