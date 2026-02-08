@@ -55,7 +55,7 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Latency ↓</th>
           <th align="right">Memory ↓</th>
         </tr>
-        <tr><td><a href="tools/cfgs/carla_models/vv_transhead.yaml">No Early Fusion</a></td><td align="right">88.2</td><td align="right">2.1ms</td><td align="right">39.5MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/vv_conv_fusion.yaml">No Early Fusion</a></td><td align="right">88.2</td><td align="right">2.1ms</td><td align="right">39.5MB</td></tr>
         <tr><td>Unidirectional</td><td align="right">89.0</td><td align="right">4.3ms</td><td align="right">63.7MB</td></tr>
         <tr><td>Bidirectional</td><td align="right">89.9</td><td align="right">6.3ms</td><td align="right">81.8MB</td></tr>
       </table>
@@ -69,7 +69,7 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Latency ↓</th>
           <th align="right">Memory ↓</th>
         </tr>
-        <tr><td><a href="tools/cfgs/carla_models/ll_msattn.yaml">No Early Fusion</a></td><td align="right">95.3</td><td align="right">2.3ms</td><td align="right">56.5MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/ll_msattn_bi_query.yaml">No Early Fusion</a></td><td align="right">95.3</td><td align="right">2.3ms</td><td align="right">56.5MB</td></tr>
         <tr><td>Unidirectional</td><td align="right">95.4</td><td align="right">4.5ms</td><td align="right">87.6MB</td></tr>
         <tr><td>Bidirectional</td><td align="right">95.6</td><td align="right">6.6ms</td><td align="right">113.9MB</td></tr>
       </table>
@@ -89,9 +89,9 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Latency ↓</th>
           <th align="right">Memory ↓</th>
         </tr>
-        <tr><td>Sparse convolution</td><td align="right">89.9</td><td align="right">15.3ms</td><td align="right">50.49MB</td></tr>
-        <tr><td>Transformer</td><td align="right">89.5</td><td align="right">29.3ms</td><td align="right">258.7MB</td></tr>
-        <tr><td>Linear RNN</td><td align="right">90.4</td><td align="right">73.8ms</td><td align="right">197.2MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/vv_msattn_bi_query.yaml">Sparse convolution</a></td><td align="right">89.9</td><td align="right">15.3ms</td><td align="right">50.49MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/dd_msattn_bi_query.yaml">Transformer</a></td><td align="right">89.5</td><td align="right">29.3ms</td><td align="right">258.7MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/ll_msattn_bi_query.yaml">Linear RNN</a></td><td align="right">90.4</td><td align="right">73.8ms</td><td align="right">197.2MB</td></tr>
       </table>
     </td>
     <td valign="top" style="width:50%; padding-left:16px;">
@@ -103,9 +103,9 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Latency ↓</th>
           <th align="right">Memory ↓</th>
         </tr>
-        <tr><td>Sparse convolution</td><td align="right">94.1</td><td align="right">20.1ms</td><td align="right">86.8MB</td></tr>
-        <tr><td>Transformer</td><td align="right">94.6</td><td align="right">45.2ms</td><td align="right">552.4MB</td></tr>
-        <tr><td><a href="tools/cfgs/carla_models/ll_msattn.yaml">Linear RNN</a></td><td align="right">95.3</td><td align="right">99.3ms</td><td align="right">417.5MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/vv_msattn_bi_query.yaml">Sparse convolution</a></td><td align="right">94.1</td><td align="right">20.1ms</td><td align="right">86.8MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/dd_msattn_bi_query.yaml">Transformer</a></td><td align="right">94.6</td><td align="right">45.2ms</td><td align="right">552.4MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/ll_msattn_bi_query.yaml">Linear RNN</a></td><td align="right">95.3</td><td align="right">99.3ms</td><td align="right">417.5MB</td></tr>
       </table>
     </td>
   </tr>
@@ -124,19 +124,19 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Memory ↓</th>
         </tr>
         <tr>
-          <td>Fully-convolutional Fusion</td>
+          <td><a href="tools/cfgs/carla_models/vv_conv_fusion.yaml">Fully-convolutional Fusion</a></td>
           <td align="right">89.9</td>
           <td align="right">1.3ms</td>
           <td align="right">214.0MB</td>
         </tr>
         <tr>
-          <td>Adaptive Gated Network</td>
+          <td><a href="tools/cfgs/carla_models/vv_gated_fusion.yaml">Adaptive Gated Network</a></td>
           <td align="right">89.3</td>
           <td align="right">8.8ms</td>
           <td align="right">215.5MB</td>
         </tr>
         <tr>
-          <td>Deformable Transformer-based</td>
+          <td><a href="tools/cfgs/carla_models/vv_msattn_bi_query.yaml">Deformable Transformer-based</a></td>
           <td align="right">90.2</td>
           <td align="right">6.1ms</td>
           <td align="right">224.8MB</td>
@@ -153,19 +153,19 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Memory ↓</th>
         </tr>
         <tr>
-          <td>Fully-convolutional Fusion</td>
+          <td><a href="tools/cfgs/carla_models/ll_conv_fusion.yaml">Fully-convolutional Fusion</a></td>
           <td align="right">94.0</td>
           <td align="right">1.4ms</td>
           <td align="right">214.0MB</td>
         </tr>
         <tr>
-          <td>Adaptive Gated Network</td>
+          <td><a href="tools/cfgs/carla_models/ll_gated_fusion.yaml">Adaptive Gated Network</a></td>
           <td align="right">94.7</td>
           <td align="right">9.8ms</td>
           <td align="right">215.5MB</td>
         </tr>
         <tr>
-          <td><a href="tools/cfgs/carla_models/ll_msattn.yaml">Deformable Transformer-based</a></td>
+          <td><a href="tools/cfgs/carla_models/ll_msattn_bi_query.yaml">Deformable Transformer-based</a></td>
           <td align="right">95.3</td>
           <td align="right">8.5ms</td>
           <td align="right">224.8MB</td>
@@ -194,19 +194,19 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Memory ↓</th>
         </tr>
         <tr>
-          <td>Radar Query</td>
+          <td><a href="tools/cfgs/carla_models/vv_msattn_radar_query.yaml">Radar Query</a></td>
           <td align="right">89.7</td>
           <td align="right">5.5ms</td>
           <td align="right">223.0MB</td>
         </tr>
         <tr>
-          <td>LiDAR Query</td>
+          <td><a href="tools/cfgs/carla_models/vv_msattn_lidar_query.yaml">LiDAR Query</a></td>
           <td align="right">90.0</td>
           <td align="right">5.8ms</td>
           <td align="right">222.5MB</td>
         </tr>
         <tr>
-          <td>Bidirectional</td>
+          <td><a href="tools/cfgs/carla_models/vv_msattn_bi_query.yaml">Bidirectional</a></td>
           <td align="right">90.2</td>
           <td align="right">6.1ms</td>
           <td align="right">224.8MB</td>
@@ -229,19 +229,19 @@ We run training 5 times and report average metrics across all results. It is wor
           <th align="right">Memory ↓</th>
         </tr>
         <tr>
-          <td>Radar Query</td>
+          <td><a href="tools/cfgs/carla_models/ll_msattn_radar_query.yaml">Radar Query</a></td>
           <td align="right">94.9</td>
           <td align="right">7.8ms</td>
           <td align="right">223.0MB</td>
         </tr>
         <tr>
-          <td>LiDAR Query</td>
+          <td><a href="tools/cfgs/carla_models/ll_msattn_lidar_query.yaml">LiDAR Query</a></td>
           <td align="right">95.2</td>
           <td align="right">8.3ms</td>
           <td align="right">222.5MB</td>
         </tr>
         <tr>
-          <td><a href="tools/cfgs/carla_models/ll_msattn.yaml">Bidirectional</a></td>
+          <td><a href="tools/cfgs/carla_models/ll_msattn_bi_query.yaml">Bidirectional</a></td>
           <td align="right">95.3</td>
           <td align="right">8.5ms</td>
           <td align="right">224.8MB</td>
