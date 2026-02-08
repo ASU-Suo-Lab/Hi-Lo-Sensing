@@ -11,8 +11,8 @@ This repo is the official implementation of our paper: On the Resolution–Perfo
 
 ## Overview
 - [🤔 Introduction](#introduction)
-- [🛠️ Main Results](#main-results)
-- [🛠️ Quick Start](#quick-start)
+- [🏆 Main Results](#main-results)
+- [🚀 Quick Start](#quick-start)
 
 
 ## Introduction
@@ -33,7 +33,7 @@ What's more, to improve the fidelity of the simulation platform in capturing the
 
 ## Main Results
 ### 3D Object Detection
-We run training 5 times and report average metrics across all results. It is worth noting that the model config files for different resolution LiDARs are the same, only the dataset paths are different.
+We run training 5 times and report average metrics across all results. Notably, we release training configuration files and trained weight files for all fusion paradigms.
 #### LiDAR-only Baseline
 |  Model  |  mAP ↑ | Latency ↓ | Memory ↓ |
 |---------|------|---------|--------|
