@@ -11,6 +11,7 @@ This repo is the official implementation of our paper: On the Resolution–Perfo
 
 ## Overview
 - [🤔 Introduction](#introduction)
+- [🛠️ Main Results](#main-results)
 - [🛠️ Quick Start](#quick-start)
 
 
@@ -30,7 +31,237 @@ What's more, to improve the fidelity of the simulation platform in capturing the
   <img src="assets/Lidar_radar_work_principle.jpg" width="100%"/>
 </div>
 
+## Main Results
+### 3D Object Detection
+We run training 5 times and report average metrics across all results. It is worth noting that the model config files for different resolution LiDARs are the same, only the dataset paths are different.
+#### LiDAR-only Baseline
+|  Model  |  mAP ↑ | Latency ↓ | Memory ↓ |
+|---------|------|---------|--------|
+|  [Low-resolution LiDAR](tools/cfgs/carla_models/lion_lidar.yaml) |  86.3  |  2.1ms  | 17.6MB |
+|  [Mid-resolution LiDAR](tools/cfgs/carla_models/lion_lidar.yaml)    |  92.4  |  2.2ms  | 42.3MB | 
+|  [High-resolution LiDAR](tools/cfgs/carla_models/lion_lidar.yaml)   |  94.5  |  2.9ms  | 98.7MB |
+
+
+
+#### Voxel-level Early Fusion
+<table cellpadding="0" cellspacing="0" style="width:100%; border-collapse:collapse;">
+  <tr>
+    <td valign="top" style="width:50%; padding-right:16px;">
+      <b>Low-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse;">
+        <tr>
+          <th align="left">Fusion Type</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr><td><a href="tools/cfgs/carla_models/vv_transhead.yaml">No Early Fusion</a></td><td align="right">88.2</td><td align="right">2.1ms</td><td align="right">39.5MB</td></tr>
+        <tr><td>Unidirectional</td><td align="right">89.0</td><td align="right">4.3ms</td><td align="right">63.7MB</td></tr>
+        <tr><td>Bidirectional</td><td align="right">89.9</td><td align="right">6.3ms</td><td align="right">81.8MB</td></tr>
+      </table>
+    </td>
+    <td valign="top" style="width:50%; padding-left:16px;">
+      <b>Mid-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse;">
+        <tr>
+          <th align="left">Fusion Type</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr><td><a href="tools/cfgs/carla_models/ll_msattn.yaml">No Early Fusion</a></td><td align="right">95.3</td><td align="right">2.3ms</td><td align="right">56.5MB</td></tr>
+        <tr><td>Unidirectional</td><td align="right">95.4</td><td align="right">4.5ms</td><td align="right">87.6MB</td></tr>
+        <tr><td>Bidirectional</td><td align="right">95.6</td><td align="right">6.6ms</td><td align="right">113.9MB</td></tr>
+      </table>
+    </td>
+  </tr>
+</table>
+
+#### Single Modality Backbones
+<table cellpadding="0" cellspacing="0" style="width:100%; border-collapse:collapse;">
+  <tr>
+    <td valign="top" style="width:50%; padding-right:16px;">
+      <b>Low-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse;">
+        <tr>
+          <th align="left">Backbone</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr><td>Sparse convolution</td><td align="right">89.9</td><td align="right">15.3ms</td><td align="right">50.49MB</td></tr>
+        <tr><td>Transformer</td><td align="right">89.5</td><td align="right">29.3ms</td><td align="right">258.7MB</td></tr>
+        <tr><td>Linear RNN</td><td align="right">90.4</td><td align="right">73.8ms</td><td align="right">197.2MB</td></tr>
+      </table>
+    </td>
+    <td valign="top" style="width:50%; padding-left:16px;">
+      <b>Mid-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse;">
+        <tr>
+          <th align="left">Backbone</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr><td>Sparse convolution</td><td align="right">94.1</td><td align="right">20.1ms</td><td align="right">86.8MB</td></tr>
+        <tr><td>Transformer</td><td align="right">94.6</td><td align="right">45.2ms</td><td align="right">552.4MB</td></tr>
+        <tr><td><a href="tools/cfgs/carla_models/ll_msattn.yaml">Linear RNN</a></td><td align="right">95.3</td><td align="right">99.3ms</td><td align="right">417.5MB</td></tr>
+      </table>
+    </td>
+  </tr>
+</table>
+
+#### Multi-modality Middle Fusion
+<table cellpadding="0" cellspacing="0" style="width:100%; border-collapse:collapse;">
+  <tr>
+    <td valign="top" style="width:50%; padding-right:16px;">
+      <b>Low-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse;">
+        <tr>
+          <th align="left">Fusion Type</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr>
+          <td>Fully-convolutional Fusion</td>
+          <td align="right">89.9</td>
+          <td align="right">1.3ms</td>
+          <td align="right">214.0MB</td>
+        </tr>
+        <tr>
+          <td>Adaptive Gated Network</td>
+          <td align="right">89.3</td>
+          <td align="right">8.8ms</td>
+          <td align="right">215.5MB</td>
+        </tr>
+        <tr>
+          <td>Deformable Transformer-based</td>
+          <td align="right">90.2</td>
+          <td align="right">6.1ms</td>
+          <td align="right">224.8MB</td>
+        </tr>
+      </table>
+    </td>
+    <td valign="top" style="width:50%; padding-left:16px;">
+      <b>Mid-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse;">
+        <tr>
+          <th align="left">Fusion Type</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr>
+          <td>Fully-convolutional Fusion</td>
+          <td align="right">94.0</td>
+          <td align="right">1.4ms</td>
+          <td align="right">214.0MB</td>
+        </tr>
+        <tr>
+          <td>Adaptive Gated Network</td>
+          <td align="right">94.7</td>
+          <td align="right">9.8ms</td>
+          <td align="right">215.5MB</td>
+        </tr>
+        <tr>
+          <td><a href="tools/cfgs/carla_models/ll_msattn.yaml">Deformable Transformer-based</a></td>
+          <td align="right">95.3</td>
+          <td align="right">8.5ms</td>
+          <td align="right">224.8MB</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+
+#### Query Direction
+<table cellpadding="0" cellspacing="0" style="width:100%; border-collapse:collapse;">
+  <tr>
+    <td valign="top" style="width:50%; padding-right:16px;">
+      <b>Low-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse; table-layout:fixed;">
+        <colgroup>
+          <col style="width:58%;">
+          <col style="width:14%;">
+          <col style="width:14%;">
+          <col style="width:14%;">
+        </colgroup>
+        <tr>
+          <th align="left">Variant</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr>
+          <td>Radar Query</td>
+          <td align="right">89.7</td>
+          <td align="right">5.5ms</td>
+          <td align="right">223.0MB</td>
+        </tr>
+        <tr>
+          <td>LiDAR Query</td>
+          <td align="right">90.0</td>
+          <td align="right">5.8ms</td>
+          <td align="right">222.5MB</td>
+        </tr>
+        <tr>
+          <td>Bidirectional</td>
+          <td align="right">90.2</td>
+          <td align="right">6.1ms</td>
+          <td align="right">224.8MB</td>
+        </tr>
+      </table>
+    </td>
+    <td valign="top" style="width:50%; padding-left:16px;">
+      <b>Mid-resolution LiDAR + 4D Radar</b><br/>
+      <table cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse; table-layout:fixed;">
+        <colgroup>
+          <col style="width:58%;">
+          <col style="width:14%;">
+          <col style="width:14%;">
+          <col style="width:14%;">
+        </colgroup>
+        <tr>
+          <th align="left">Variant</th>
+          <th align="right">mAP ↑</th>
+          <th align="right">Latency ↓</th>
+          <th align="right">Memory ↓</th>
+        </tr>
+        <tr>
+          <td>Radar Query</td>
+          <td align="right">94.9</td>
+          <td align="right">7.8ms</td>
+          <td align="right">223.0MB</td>
+        </tr>
+        <tr>
+          <td>LiDAR Query</td>
+          <td align="right">95.2</td>
+          <td align="right">8.3ms</td>
+          <td align="right">222.5MB</td>
+        </tr>
+        <tr>
+          <td><a href="tools/cfgs/carla_models/ll_msattn.yaml">Bidirectional</a></td>
+          <td align="right">95.3</td>
+          <td align="right">8.5ms</td>
+          <td align="right">224.8MB</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+
+
 ## Quick Start
+### Requirements
+All the codes are tested in the following environment:
+* Ubuntu 22.04
+* Python 3.8.20
+* PyTorch 2.1.2
+* CUDA 12.1
+* [`spconv v2.x`](https://github.com/traveller59/spconv)
+
+
 ### Installation
 Please follow [OpenPCDet's official instructions](https://github.com/open-mmlab/OpenPCDet/blob/master/docs/INSTALL.md) to set up the environment first.
 
