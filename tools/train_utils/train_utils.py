@@ -1,6 +1,8 @@
 import os
+import math
 
 import torch
+import torch.distributed as dist
 import tqdm
 import time
 import glob
@@ -8,17 +10,84 @@ from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
 
 
+def _ddp_all_ranks_true(flag: bool, device: torch.device) -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return flag
+    flag_tensor = torch.tensor([1 if flag else 0], device=device, dtype=torch.int32)
+    dist.all_reduce(flag_tensor, op=dist.ReduceOp.MIN)
+    return bool(flag_tensor.item())
+
+
+def _optimizer_zero_grad(optimizer) -> None:
+    try:
+        optimizer.zero_grad(set_to_none=True)
+    except TypeError:
+        optimizer.zero_grad()
+
+
+def _collect_nonfinite_grad_names(model, limit: int = 6):
+    bad_names = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if not torch.isfinite(param.grad).all():
+            bad_names.append(name)
+            if len(bad_names) >= limit:
+                break
+    return bad_names
+
+
+def _collect_large_grad_names(model, limit: int = 6):
+    grad_stats = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grad_abs_max = float(param.grad.detach().abs().max().item())
+        if math.isfinite(grad_abs_max):
+            grad_stats.append((grad_abs_max, name))
+    grad_stats.sort(reverse=True)
+    return [name for _, name in grad_stats[:limit]]
+
+
+def _sanitize_nonfinite_gradients(model, clamp_value: float = 1e3) -> bool:
+    found = False
+    for _, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if not torch.isfinite(param.grad).all():
+            found = True
+            param.grad.data = torch.nan_to_num(
+                param.grad.data, nan=0.0, posinf=clamp_value, neginf=-clamp_value
+            )
+        if clamp_value is not None:
+            param.grad.data.clamp_(min=-clamp_value, max=clamp_value)
+    return found
+
+
+def _clip_grad_values_(model, clip_value: float) -> None:
+    if clip_value is None:
+        return
+    for _, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        param.grad.data.clamp_(min=-clip_value, max=clip_value)
+
+
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, 
                     use_logger_to_record=False, logger=None, logger_iter_interval=50, cur_epoch=None, 
-                    total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300, show_gpu_stat=False, use_amp=False):
+                    total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300, show_gpu_stat=False,
+                    use_amp=False, amp_dtype='fp16'):
     if total_it_each_epoch == len(train_loader):
         dataloader_iter = iter(train_loader)
 
     ckpt_save_cnt = 1
     start_it = accumulated_iter % total_it_each_epoch
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp, init_scale=optim_cfg.get('LOSS_SCALE_FP16', 2.0**16))
+    autocast_dtype = torch.float16 if amp_dtype == 'fp16' else torch.bfloat16
+    use_grad_scaler = use_amp and amp_dtype == 'fp16'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler, init_scale=optim_cfg.get('LOSS_SCALE_FP16', 2.0**16))
+    grad_value_clip = optim_cfg.get('GRAD_VALUE_CLIP', None)
     
     if rank == 0:
         pbar = tqdm.tqdm(total=total_it_each_epoch, leave=leave_pbar, desc='train', dynamic_ncols=True)
@@ -50,16 +119,83 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
 
         model.train()
-        optimizer.zero_grad()
+        _optimizer_zero_grad(optimizer)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=autocast_dtype):
             loss, tb_dict, disp_dict = model_func(model, batch)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
+        loss_is_finite = _ddp_all_ranks_true(bool(torch.isfinite(loss).all().item()), loss.device)
+        if not loss_is_finite:
+            _optimizer_zero_grad(optimizer)
+            if rank == 0 and logger is not None:
+                logger.warning('Skip iteration %d due to non-finite loss.', accumulated_iter)
+            accumulated_iter += 1
+            end = time.time()
+            continue
+
+        if use_grad_scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            _clip_grad_values_(model, grad_value_clip)
+            grad_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+            grad_is_finite = _ddp_all_ranks_true(bool(torch.isfinite(grad_norm).all().item()), loss.device)
+            if grad_is_finite:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                bad_names = _collect_nonfinite_grad_names(model)
+                if not bad_names:
+                    bad_names = _collect_large_grad_names(model)
+                sanitized = _sanitize_nonfinite_gradients(model, clamp_value=grad_value_clip or 1e3)
+                _clip_grad_values_(model, grad_value_clip)
+                if sanitized or bad_names:
+                    grad_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+                    grad_is_finite = _ddp_all_ranks_true(bool(torch.isfinite(grad_norm).all().item()), loss.device)
+                if grad_is_finite:
+                    if rank == 0 and logger is not None:
+                        logger.warning(
+                            'Sanitized non-finite gradients at iteration %d. Example params: %s',
+                            accumulated_iter, ', '.join(bad_names) if bad_names else '<unknown>'
+                        )
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    _optimizer_zero_grad(optimizer)
+                    if rank == 0 and logger is not None:
+                        logger.warning(
+                            'Skip iteration %d due to non-finite gradients. Example params: %s',
+                            accumulated_iter, ', '.join(bad_names) if bad_names else '<unknown>'
+                        )
+        else:
+            loss.backward()
+            _clip_grad_values_(model, grad_value_clip)
+            grad_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+            grad_is_finite = _ddp_all_ranks_true(bool(torch.isfinite(grad_norm).all().item()), loss.device)
+            if grad_is_finite:
+                optimizer.step()
+            else:
+                bad_names = _collect_nonfinite_grad_names(model)
+                if not bad_names:
+                    bad_names = _collect_large_grad_names(model)
+                sanitized = _sanitize_nonfinite_gradients(model, clamp_value=grad_value_clip or 1e3)
+                _clip_grad_values_(model, grad_value_clip)
+                if sanitized or bad_names:
+                    grad_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+                    grad_is_finite = _ddp_all_ranks_true(bool(torch.isfinite(grad_norm).all().item()), loss.device)
+                if grad_is_finite:
+                    if rank == 0 and logger is not None:
+                        logger.warning(
+                            'Sanitized non-finite gradients at iteration %d. Example params: %s',
+                            accumulated_iter, ', '.join(bad_names) if bad_names else '<unknown>'
+                        )
+                    optimizer.step()
+                else:
+                    _optimizer_zero_grad(optimizer)
+                    if rank == 0 and logger is not None:
+                        logger.warning(
+                            'Skip iteration %d due to non-finite gradients. Example params: %s',
+                            accumulated_iter, ', '.join(bad_names) if bad_names else '<unknown>'
+                        )
 
         accumulated_iter += 1
  
@@ -150,7 +286,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
 def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
-                merge_all_iters_to_one_epoch=False, use_amp=False,
+                merge_all_iters_to_one_epoch=False, use_amp=False, amp_dtype='fp16',
                 use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, cfg=None):
     accumulated_iter = start_iter
 
@@ -191,7 +327,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 logger=logger, logger_iter_interval=logger_iter_interval,
                 ckpt_save_dir=ckpt_save_dir, ckpt_save_time_interval=ckpt_save_time_interval, 
                 show_gpu_stat=show_gpu_stat,
-                use_amp=use_amp
+                use_amp=use_amp,
+                amp_dtype=amp_dtype
             )
 
             # save trained model

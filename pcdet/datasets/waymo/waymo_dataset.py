@@ -9,7 +9,10 @@ import copy
 import numpy as np
 import torch
 import multiprocessing
-import SharedArray
+try:
+    import SharedArray
+except ImportError:
+    SharedArray = None
 import torch.distributed as dist
 from tqdm import tqdm
 from pathlib import Path
@@ -34,6 +37,8 @@ class WaymoDataset(DatasetTemplate):
         self.seq_name_to_infos = self.include_waymo_data(self.mode)
 
         self.use_shared_memory = self.dataset_cfg.get('USE_SHARED_MEMORY', False) and self.training
+        if self.use_shared_memory and SharedArray is None:
+            raise ImportError('SharedArray is required when USE_SHARED_MEMORY=True')
         if self.use_shared_memory:
             self.shared_memory_file_limit = self.dataset_cfg.get('SHARED_MEMORY_FILE_LIMIT', 0x7FFFFFFF)
             self.load_data_to_shared_memory()

@@ -1,14 +1,21 @@
+import copy
+import importlib
+import inspect
 from functools import partial
-
 import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch_scatter
-from mamba_ssm import Block as MambaBlock
 from torch.nn import functional as F
+from torch.profiler import record_function
 from ...utils.spconv_utils import replace_feature, spconv
 import torch.utils.checkpoint as cp
+
+try:
+    from ...ops.lion_map_ops.lion_map_ops import fused_build_group_mappings
+except ImportError:
+    fused_build_group_mappings = None
 
 @torch.inference_mode()
 def get_window_coors_shift_v2(coords, sparse_shape, window_shape, shift=False):
@@ -72,114 +79,142 @@ class FlattenedWindowMapping(nn.Module):
             window_shape,
             group_size,
             shift,
-            win_version='v2'
+            win_version='v2',
+            use_fused_mapping=False
     ) -> None:
         super().__init__()
         self.window_shape = window_shape
         self.group_size = group_size
         self.win_version = win_version
         self.shift = shift
+        self.use_fused_mapping = use_fused_mapping
 
-    def forward(self, coords: torch.Tensor, batch_size: int, sparse_shape: list):
-        coords = coords.long()
-        _, num_per_batch = torch.unique(coords[:, 0], sorted=False, return_counts=True)
+    def _build_group_mappings(self, batch_ids: torch.Tensor, batch_size: int):
+        if self.use_fused_mapping and fused_build_group_mappings is not None and batch_ids.is_cuda:
+            flat2win, win2flat = fused_build_group_mappings(batch_ids, batch_size, self.group_size)
+            if (
+                flat2win.dim() == 1
+                and win2flat.dim() == 1
+                and win2flat.numel() == batch_ids.numel()
+                and flat2win.numel() % self.group_size == 0
+            ):
+                return flat2win, win2flat
+
+        num_per_batch = torch.bincount(batch_ids, minlength=batch_size)
         batch_start_indices = F.pad(torch.cumsum(num_per_batch, dim=0), (1, 0))
         num_per_batch_p = (
-                torch.div(
-                    batch_start_indices[1:] - batch_start_indices[:-1] + self.group_size - 1,
-                    self.group_size,
-                    rounding_mode="trunc",
-                )
-                * self.group_size
+            torch.div(num_per_batch + self.group_size - 1, self.group_size, rounding_mode="trunc") * self.group_size
         )
-
         batch_start_indices_p = F.pad(torch.cumsum(num_per_batch_p, dim=0), (1, 0))
-        flat2win = torch.arange(batch_start_indices_p[-1], device=coords.device)  # .to(coords.device)
-        win2flat = torch.arange(batch_start_indices[-1], device=coords.device)  # .to(coords.device)
+        batch_offsets = batch_start_indices_p[:-1] - batch_start_indices[:-1]
 
-        for i in range(batch_size):
-            if num_per_batch[i] != num_per_batch_p[i]:
-                
-                bias_index = batch_start_indices_p[i] - batch_start_indices[i]
-                flat2win[
-                    batch_start_indices_p[i + 1] - self.group_size + (num_per_batch[i] % self.group_size):
-                    batch_start_indices_p[i + 1]
-                    ] = flat2win[
-                        batch_start_indices_p[i + 1]
-                        - 2 * self.group_size
-                        + (num_per_batch[i] % self.group_size): batch_start_indices_p[i + 1] - self.group_size
-                        ] if (batch_start_indices_p[i + 1] - batch_start_indices_p[i]) - self.group_size != 0 else \
-                        win2flat[batch_start_indices[i]: batch_start_indices[i + 1]].repeat(
-                            (batch_start_indices_p[i + 1] - batch_start_indices_p[i]) // num_per_batch[i] + 1)[
-                        : self.group_size - (num_per_batch[i] % self.group_size)] + bias_index
+        total_valid = int(batch_start_indices[-1].item())
+        total_padded = int(batch_start_indices_p[-1].item())
+        device = batch_ids.device
 
-
-            win2flat[batch_start_indices[i]: batch_start_indices[i + 1]] += (
-                    batch_start_indices_p[i] - batch_start_indices[i]
+        if total_valid > 0:
+            point_batch_ids = torch.repeat_interleave(
+                torch.arange(batch_size, device=device, dtype=torch.long), num_per_batch
             )
+            win2flat = torch.arange(total_valid, device=device, dtype=torch.long) + batch_offsets[point_batch_ids]
+        else:
+            win2flat = torch.empty(0, device=device, dtype=torch.long)
 
-            flat2win[batch_start_indices_p[i]: batch_start_indices_p[i + 1]] -= (
-                    batch_start_indices_p[i] - batch_start_indices[i]
+        if total_padded > 0:
+            padded_batch_ids = torch.repeat_interleave(
+                torch.arange(batch_size, device=device, dtype=torch.long), num_per_batch_p
             )
+            flat2win = torch.arange(total_padded, device=device, dtype=torch.long) - batch_offsets[padded_batch_ids]
+        else:
+            flat2win = torch.empty(0, device=device, dtype=torch.long)
 
-        mappings = {"flat2win": flat2win, "win2flat": win2flat}
+        tail_lengths = num_per_batch_p - num_per_batch
+        tail_batch_ids = torch.where(tail_lengths > 0)[0]
+        for batch_idx in tail_batch_ids.tolist():
+            valid_count = int(num_per_batch[batch_idx].item())
+            if valid_count == 0:
+                continue
 
-        get_win = self.win_version
+            padded_count = int(num_per_batch_p[batch_idx].item())
+            tail_len = int(tail_lengths[batch_idx].item())
+            batch_end_p = int(batch_start_indices_p[batch_idx + 1].item())
 
-        if get_win == 'v1':
-            for shifted in [False]:
-                (
-                    n2,
-                    m2,
-                    n1,
-                    m1,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                ) = get_window_coors_shift_v1(coords, sparse_shape, self.window_shape)
-                vx = (n1 * y1 + (-1) ** y1 * x1) * n2 * m2 + (-1) ** y1 * (m2 * x2 + (-1) ** x2 * y2)
-                vx += coords[:, 0] * sparse_shape[2] * sparse_shape[1] * sparse_shape[0]
-                vy = (m1 * x1 + (-1) ** x1 * y1) * m2 * n2 + (-1) ** x1 * (n2 * y2 + (-1) ** y2 * x2)
-                vy += coords[:, 0] * sparse_shape[2] * sparse_shape[1] * sparse_shape[0]
-                _, mappings["x" + ("_shift" if shifted else "")] = torch.sort(vx)
-                _, mappings["y" + ("_shift" if shifted else "")] = torch.sort(vy)
+            if padded_count > self.group_size:
+                src_start = batch_end_p - self.group_size - tail_len
+                src_end = batch_end_p - self.group_size
+                flat2win[batch_end_p - tail_len: batch_end_p] = flat2win[src_start: src_end]
+            else:
+                repeat_count = (tail_len + valid_count - 1) // valid_count + 1
+                repeated = torch.arange(valid_count, device=device, dtype=torch.long).repeat(repeat_count)
+                flat2win[batch_end_p - tail_len: batch_end_p] = repeated[:tail_len]
 
-        elif get_win == 'v2':
-            batch_win_inds_x, batch_win_inds_y, coors_in_win = get_window_coors_shift_v2(coords, sparse_shape,
-                                                                                         self.window_shape, self.shift)
-            vx = batch_win_inds_x * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
-            vx += coors_in_win[..., 2] * self.window_shape[1] * self.window_shape[2] + coors_in_win[..., 1] * \
-                  self.window_shape[2] + coors_in_win[..., 0]
+        return flat2win, win2flat
 
-            vy = batch_win_inds_y * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
-            vy += coors_in_win[..., 1] * self.window_shape[0] * self.window_shape[2] + coors_in_win[..., 2] * \
-                  self.window_shape[2] + coors_in_win[..., 0]
+    def forward(self, coords: torch.Tensor, batch_size: int, sparse_shape: list):
+        with record_function('LION/FlattenedWindowMapping'):
+            if coords.dtype != torch.long:
+                coords = coords.long()
+            flat2win, win2flat = self._build_group_mappings(coords[:, 0], batch_size)
+            mappings = {"flat2win": flat2win, "win2flat": win2flat}
 
-            _, mappings["x"] = torch.sort(vx)
-            _, mappings["y"] = torch.sort(vy)
+            get_win = self.win_version
 
-        elif get_win == 'v3':
-            batch_win_inds_x, batch_win_inds_y, coors_in_win = get_window_coors_shift_v2(coords, sparse_shape,
-                                                                                         self.window_shape)
-            vx = batch_win_inds_x * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
-            vx_xy = vx + coors_in_win[..., 2] * self.window_shape[1] * self.window_shape[2] + coors_in_win[..., 1] * \
-                    self.window_shape[2] + coors_in_win[..., 0]
-            vx_yx = vx + coors_in_win[..., 1] * self.window_shape[0] * self.window_shape[2] + coors_in_win[..., 2] * \
-                    self.window_shape[2] + coors_in_win[..., 0]
+            if get_win == 'v1':
+                for shifted in [False]:
+                    (
+                        n2,
+                        m2,
+                        n1,
+                        m1,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                    ) = get_window_coors_shift_v1(coords, sparse_shape, self.window_shape)
+                    vx = (n1 * y1 + (-1) ** y1 * x1) * n2 * m2 + (-1) ** y1 * (m2 * x2 + (-1) ** x2 * y2)
+                    vx += coords[:, 0] * sparse_shape[2] * sparse_shape[1] * sparse_shape[0]
+                    vy = (m1 * x1 + (-1) ** x1 * y1) * m2 * n2 + (-1) ** x1 * (n2 * y2 + (-1) ** y2 * x2)
+                    vy += coords[:, 0] * sparse_shape[2] * sparse_shape[1] * sparse_shape[0]
+                    _, mappings["x" + ("_shift" if shifted else "")] = torch.sort(vx)
+                    _, mappings["y" + ("_shift" if shifted else "")] = torch.sort(vy)
 
-            vy = batch_win_inds_y * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
-            vy_xy = vy + coors_in_win[..., 2] * self.window_shape[1] * self.window_shape[2] + coors_in_win[..., 1] * \
-                    self.window_shape[2] + coors_in_win[..., 0]
-            vy_yx = vy + coors_in_win[..., 1] * self.window_shape[0] * self.window_shape[2] + coors_in_win[..., 2] * \
-                    self.window_shape[2] + coors_in_win[..., 0]
+            elif get_win == 'v2':
+                batch_win_inds_x, batch_win_inds_y, coors_in_win = get_window_coors_shift_v2(
+                    coords, sparse_shape, self.window_shape, self.shift
+                )
+                vx = batch_win_inds_x * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
+                vx += coors_in_win[..., 2] * self.window_shape[1] * self.window_shape[2] + coors_in_win[..., 1] * \
+                      self.window_shape[2] + coors_in_win[..., 0]
 
-            _, mappings["x_xy"] = torch.sort(vx_xy)
-            _, mappings["y_xy"] = torch.sort(vy_xy)
-            _, mappings["x_yx"] = torch.sort(vx_yx)
-            _, mappings["y_yx"] = torch.sort(vy_yx)
+                vy = batch_win_inds_y * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
+                vy += coors_in_win[..., 1] * self.window_shape[0] * self.window_shape[2] + coors_in_win[..., 2] * \
+                      self.window_shape[2] + coors_in_win[..., 0]
 
-        return mappings
+                _, mappings["x"] = torch.sort(vx)
+                _, mappings["y"] = torch.sort(vy)
+
+            elif get_win == 'v3':
+                batch_win_inds_x, batch_win_inds_y, coors_in_win = get_window_coors_shift_v2(
+                    coords, sparse_shape, self.window_shape
+                )
+                vx = batch_win_inds_x * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
+                vx_xy = vx + coors_in_win[..., 2] * self.window_shape[1] * self.window_shape[2] + coors_in_win[..., 1] * \
+                        self.window_shape[2] + coors_in_win[..., 0]
+                vx_yx = vx + coors_in_win[..., 1] * self.window_shape[0] * self.window_shape[2] + coors_in_win[..., 2] * \
+                        self.window_shape[2] + coors_in_win[..., 0]
+
+                vy = batch_win_inds_y * self.window_shape[0] * self.window_shape[1] * self.window_shape[2]
+                vy_xy = vy + coors_in_win[..., 2] * self.window_shape[1] * self.window_shape[2] + coors_in_win[..., 1] * \
+                        self.window_shape[2] + coors_in_win[..., 0]
+                vy_yx = vy + coors_in_win[..., 1] * self.window_shape[0] * self.window_shape[2] + coors_in_win[..., 2] * \
+                        self.window_shape[2] + coors_in_win[..., 0]
+
+                _, mappings["x_xy"] = torch.sort(vx_xy)
+                _, mappings["y_xy"] = torch.sort(vy_xy)
+                _, mappings["x_yx"] = torch.sort(vx_yx)
+                _, mappings["y_yx"] = torch.sort(vy_yx)
+
+            return mappings
 
 
 class PatchMerging3D(nn.Module):
@@ -206,104 +241,98 @@ class PatchMerging3D(nn.Module):
         self.num_points = 6 #3
 
     def forward(self, x, coords_shift=1, diffusion_scale=4):
-        assert diffusion_scale==4 or diffusion_scale==2
-        x = self.sub_conv(x)
+        with record_function('LION/PatchMerging3D'):
+            assert diffusion_scale==4 or diffusion_scale==2
+            x = self.sub_conv(x)
+            d, h, w = x.spatial_shape
+            down_scale = self.down_scale
 
-        d, h, w = x.spatial_shape
-        down_scale = self.down_scale
+            if self.diffusion:
+                x_feat_att = x.features.mean(-1)
+                batch_size = x.indices[:, 0].max() + 1
+                selected_diffusion_feats_list = [x.features.clone()]
+                selected_diffusion_coords_list = [x.indices.clone()]
+                for i in range(batch_size):
+                    mask = x.indices[:, 0] == i
+                    valid_num = mask.sum()
+                    K = int(valid_num * self.diff_scale)
+                    _, indices = torch.topk(x_feat_att[mask], K)
 
-        if self.diffusion:
-            x_feat_att = x.features.mean(-1)
-            batch_size = x.indices[:, 0].max() + 1
-            selected_diffusion_feats_list = [x.features.clone()]
-            selected_diffusion_coords_list = [x.indices.clone()]
-            for i in range(batch_size):
-                mask = x.indices[:, 0] == i
-                valid_num = mask.sum()
-                K = int(valid_num * self.diff_scale)
-                _, indices = torch.topk(x_feat_att[mask], K)
+                    selected_coords_copy = x.indices[mask][indices].clone()
+                    selected_coords_num = selected_coords_copy.shape[0]
+                    selected_coords_expand = selected_coords_copy.repeat(diffusion_scale, 1)
+                    selected_feats_expand = x.features[mask][indices].repeat(diffusion_scale, 1) * 0.0
 
-                selected_coords_copy = x.indices[mask][indices].clone()
-                selected_coords_num = selected_coords_copy.shape[0]
-                selected_coords_expand = selected_coords_copy.repeat(diffusion_scale, 1)
-                selected_feats_expand = x.features[mask][indices].repeat(diffusion_scale, 1) * 0.0
+                    selected_coords_expand[selected_coords_num * 0:selected_coords_num * 1, 3:4] = (
+                                selected_coords_copy[:, 3:4] - coords_shift).clamp(min=0, max=w - 1)
+                    selected_coords_expand[selected_coords_num * 0:selected_coords_num * 1, 2:3] = (
+                                selected_coords_copy[:, 2:3] + coords_shift).clamp(min=0, max=h - 1)
+                    selected_coords_expand[selected_coords_num * 0:selected_coords_num * 1, 1:2] = (
+                            selected_coords_copy[:, 1:2]).clamp(min=0, max=d - 1)
 
-
-                selected_coords_expand[selected_coords_num * 0:selected_coords_num * 1, 3:4] = (
-                            selected_coords_copy[:, 3:4] - coords_shift).clamp(min=0, max=w - 1)
-                selected_coords_expand[selected_coords_num * 0:selected_coords_num * 1, 2:3] = (
-                            selected_coords_copy[:, 2:3] + coords_shift).clamp(min=0, max=h - 1)
-                selected_coords_expand[selected_coords_num * 0:selected_coords_num * 1, 1:2] = (
-                        selected_coords_copy[:, 1:2]).clamp(min=0, max=d - 1)
-
-                selected_coords_expand[selected_coords_num:selected_coords_num * 2, 3:4] = (
-                        selected_coords_copy[:, 3:4] + coords_shift).clamp(min=0, max=w - 1)
-                selected_coords_expand[selected_coords_num:selected_coords_num * 2, 2:3] = (
-                        selected_coords_copy[:, 2:3] + coords_shift).clamp(min=0, max=h - 1)
-                selected_coords_expand[selected_coords_num:selected_coords_num * 2, 1:2] = (
-                    selected_coords_copy[:, 1:2]).clamp(min=0, max=d - 1)
-
-                if diffusion_scale==4:
-#                         print('####diffusion_scale==4')
-                    selected_coords_expand[selected_coords_num * 2:selected_coords_num * 3, 3:4] = (
-                        selected_coords_copy[:, 3:4] - coords_shift).clamp(min=0, max=w - 1)
-                    selected_coords_expand[selected_coords_num * 2:selected_coords_num * 3, 2:3] = (
-                        selected_coords_copy[:, 2:3] - coords_shift).clamp(min=0, max=h - 1)
-                    selected_coords_expand[selected_coords_num * 2:selected_coords_num * 3, 1:2] = (
-                    selected_coords_copy[:, 1:2]).clamp(min=0, max=d - 1)
-
-                    selected_coords_expand[selected_coords_num * 3:selected_coords_num * 4, 3:4] = (
+                    selected_coords_expand[selected_coords_num:selected_coords_num * 2, 3:4] = (
                             selected_coords_copy[:, 3:4] + coords_shift).clamp(min=0, max=w - 1)
-                    selected_coords_expand[selected_coords_num * 3:selected_coords_num * 4, 2:3] = (
-                            selected_coords_copy[:, 2:3] - coords_shift).clamp(min=0, max=h - 1)
-                    selected_coords_expand[selected_coords_num * 3:selected_coords_num * 4, 1:2] = (
+                    selected_coords_expand[selected_coords_num:selected_coords_num * 2, 2:3] = (
+                            selected_coords_copy[:, 2:3] + coords_shift).clamp(min=0, max=h - 1)
+                    selected_coords_expand[selected_coords_num:selected_coords_num * 2, 1:2] = (
                         selected_coords_copy[:, 1:2]).clamp(min=0, max=d - 1)
 
-                selected_diffusion_coords_list.append(selected_coords_expand)
-                selected_diffusion_feats_list.append(selected_feats_expand)
+                    if diffusion_scale == 4:
+                        selected_coords_expand[selected_coords_num * 2:selected_coords_num * 3, 3:4] = (
+                            selected_coords_copy[:, 3:4] - coords_shift).clamp(min=0, max=w - 1)
+                        selected_coords_expand[selected_coords_num * 2:selected_coords_num * 3, 2:3] = (
+                            selected_coords_copy[:, 2:3] - coords_shift).clamp(min=0, max=h - 1)
+                        selected_coords_expand[selected_coords_num * 2:selected_coords_num * 3, 1:2] = (
+                            selected_coords_copy[:, 1:2]).clamp(min=0, max=d - 1)
 
-            coords = torch.cat(selected_diffusion_coords_list)
-            final_diffusion_feats = torch.cat(selected_diffusion_feats_list)
+                        selected_coords_expand[selected_coords_num * 3:selected_coords_num * 4, 3:4] = (
+                                selected_coords_copy[:, 3:4] + coords_shift).clamp(min=0, max=w - 1)
+                        selected_coords_expand[selected_coords_num * 3:selected_coords_num * 4, 2:3] = (
+                                selected_coords_copy[:, 2:3] - coords_shift).clamp(min=0, max=h - 1)
+                        selected_coords_expand[selected_coords_num * 3:selected_coords_num * 4, 1:2] = (
+                            selected_coords_copy[:, 1:2]).clamp(min=0, max=d - 1)
 
-        else:
-            coords = x.indices.clone()
-            final_diffusion_feats = x.features.clone()
+                    selected_diffusion_coords_list.append(selected_coords_expand)
+                    selected_diffusion_feats_list.append(selected_feats_expand)
 
-        coords[:, 3:4] = coords[:, 3:4] // down_scale[0]
-        coords[:, 2:3] = coords[:, 2:3] // down_scale[1]
-        coords[:, 1:2] = coords[:, 1:2] // down_scale[2]
+                coords = torch.cat(selected_diffusion_coords_list)
+                final_diffusion_feats = torch.cat(selected_diffusion_feats_list)
 
-        scale_xyz = (x.spatial_shape[0] // down_scale[2]) * (x.spatial_shape[1] // down_scale[1]) * (
-                x.spatial_shape[2] // down_scale[0])
-        scale_yz = (x.spatial_shape[0] // down_scale[2]) * (x.spatial_shape[1] // down_scale[1])
-        scale_z = (x.spatial_shape[0] // down_scale[2])
+            else:
+                coords = x.indices.clone()
+                final_diffusion_feats = x.features.clone()
 
+            coords[:, 3:4] = coords[:, 3:4] // down_scale[0]
+            coords[:, 2:3] = coords[:, 2:3] // down_scale[1]
+            coords[:, 1:2] = coords[:, 1:2] // down_scale[2]
 
-        merge_coords = coords[:, 0].int() * scale_xyz + coords[:, 3] * scale_yz + coords[:, 2] * scale_z + coords[:, 1]
+            scale_xyz = (x.spatial_shape[0] // down_scale[2]) * (x.spatial_shape[1] // down_scale[1]) * (
+                    x.spatial_shape[2] // down_scale[0])
+            scale_yz = (x.spatial_shape[0] // down_scale[2]) * (x.spatial_shape[1] // down_scale[1])
+            scale_z = (x.spatial_shape[0] // down_scale[2])
 
-        features_expand = final_diffusion_feats
+            merge_coords = coords[:, 0].int() * scale_xyz + coords[:, 3] * scale_yz + coords[:, 2] * scale_z + coords[:, 1]
+            features_expand = final_diffusion_feats
 
-        new_sparse_shape = [math.ceil(x.spatial_shape[i] / down_scale[2 - i]) for i in range(3)]
-        unq_coords, unq_inv = torch.unique(merge_coords, return_inverse=True, return_counts=False, dim=0)
+            new_sparse_shape = [math.ceil(x.spatial_shape[i] / down_scale[2 - i]) for i in range(3)]
+            unq_coords, unq_inv = torch.unique(merge_coords, return_inverse=True, return_counts=False, dim=0)
+            x_merge = torch_scatter.scatter_add(features_expand, unq_inv, dim=0)
 
-        x_merge = torch_scatter.scatter_add(features_expand, unq_inv, dim=0)
+            unq_coords = unq_coords.int()
+            voxel_coords = torch.stack((unq_coords // scale_xyz,
+                                        (unq_coords % scale_xyz) // scale_yz,
+                                        (unq_coords % scale_yz) // scale_z,
+                                        unq_coords % scale_z), dim=1)
+            voxel_coords = voxel_coords[:, [0, 3, 2, 1]]
 
-        unq_coords = unq_coords.int()
-        voxel_coords = torch.stack((unq_coords // scale_xyz,
-                                    (unq_coords % scale_xyz) // scale_yz,
-                                    (unq_coords % scale_yz) // scale_z,
-                                    unq_coords % scale_z), dim=1)
-        voxel_coords = voxel_coords[:, [0, 3, 2, 1]]
-
-        x_merge = self.norm(x_merge)
-
-        x_merge = spconv.SparseConvTensor(
-            features=x_merge,
-            indices=voxel_coords.int(),
-            spatial_shape=new_sparse_shape,
-            batch_size=x.batch_size
-        )
-        return x_merge, unq_inv
+            x_merge = self.norm(x_merge)
+            x_merge = spconv.SparseConvTensor(
+                features=x_merge,
+                indices=voxel_coords.int(),
+                spatial_shape=new_sparse_shape,
+                batch_size=x.batch_size
+            )
+            return x_merge, unq_inv
 
 
 class PatchExpanding3D(nn.Module):
@@ -312,16 +341,140 @@ class PatchExpanding3D(nn.Module):
         self.dim = dim
 
     def forward(self, x, up_x, unq_inv):
-        # z, y, x
-        n, c = x.features.shape
+        with record_function('LION/PatchExpanding3D'):
+            n, c = x.features.shape
+            x_copy = torch.gather(x.features, 0, unq_inv.unsqueeze(1).repeat(1, c))
+            up_x = up_x.replace_feature(up_x.features + x_copy)
+            return up_x
 
-        x_copy = torch.gather(x.features, 0, unq_inv.unsqueeze(1).repeat(1, c))
-        up_x = up_x.replace_feature(up_x.features + x_copy)
-        return up_x
+
+def _resolve_fla_gla_cls():
+    module_candidates = [
+        ('fla.layers', 'GatedLinearAttention'),
+        ('fla.layers.gla', 'GatedLinearAttention'),
+    ]
+    errors = []
+    for module_name, class_name in module_candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            errors.append(f'{module_name}: {exc}')
+            continue
+        gla_cls = getattr(module, class_name, None)
+        if gla_cls is not None:
+            return gla_cls
+
+    raise ImportError(
+        'Unable to import FLA GatedLinearAttention. Install flash-linear-attention and ensure '
+        'one of these symbols exists: fla.layers.GatedLinearAttention or '
+        'fla.layers.gla.GatedLinearAttention. Import attempts: ' + '; '.join(errors)
+    )
+
+
+def _resolve_mamba_block_cls():
+    try:
+        module = importlib.import_module('mamba_ssm')
+    except ImportError as exc:
+        raise ImportError(
+            'LION operator "Mamba" requires the "mamba_ssm" package and its causal-conv1d '
+            'dependency. Install them before selecting MODEL.BACKBONE_3D.OPERATOR.NAME=Mamba.'
+        ) from exc
+
+    block_cls = getattr(module, 'Block', None)
+    if block_cls is None:
+        raise ImportError('Unable to find Block in the installed mamba_ssm package.')
+    return block_cls
+
+
+class FLAGatedLinearAttentionAdapter(nn.Module):
+    def __init__(self, d_model, cfg):
+        super().__init__()
+        gla_cls = _resolve_fla_gla_cls()
+        raw_cfg = copy.deepcopy(dict(cfg)) if cfg is not None else {}
+        self.seq_first = raw_cfg.pop('seq_first', True)
+        self.force_fp32_train = raw_cfg.pop('force_fp32_train', True)
+        self.input_clip = raw_cfg.pop('input_clip', 100.0)
+        self.output_clip = raw_cfg.pop('output_clip', 100.0)
+        num_heads = raw_cfg.get('num_heads')
+        expand_k = raw_cfg.get('expand_k', 1.0)
+        expand_v = raw_cfg.get('expand_v', 1.0)
+        if num_heads is not None:
+            key_dim = int(round(d_model * expand_k / num_heads))
+            value_dim = int(round(d_model * expand_v / num_heads))
+            if key_dim < 16 or value_dim < 16:
+                raise ValueError(
+                    'FLA_GLA requires per-head key/value dims >= 16 for Triton training kernels. '
+                    f'Got d_model={d_model}, num_heads={num_heads}, expand_k={expand_k}, '
+                    f'expand_v={expand_v}, so key_dim={key_dim}, value_dim={value_dim}. '
+                    'Increase expand_k/expand_v or reduce num_heads.'
+                )
+        raw_cfg.setdefault('hidden_size', d_model)
+        raw_cfg.setdefault('d_model', d_model)
+        raw_cfg.setdefault('embed_dim', d_model)
+
+        signature = inspect.signature(gla_cls.__init__)
+        init_kwargs = {}
+        for key, value in raw_cfg.items():
+            if key in signature.parameters:
+                init_kwargs[key] = value
+
+        if 'hidden_size' in signature.parameters and 'hidden_size' not in init_kwargs:
+            init_kwargs['hidden_size'] = d_model
+        if 'd_model' in signature.parameters and 'd_model' not in init_kwargs:
+            init_kwargs['d_model'] = d_model
+        if 'embed_dim' in signature.parameters and 'embed_dim' not in init_kwargs:
+            init_kwargs['embed_dim'] = d_model
+
+        self.operator = gla_cls(**init_kwargs)
+        self.d_model = d_model
+
+    def forward(self, x):
+        operator_input = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+        if self.input_clip is not None:
+            operator_input = torch.clamp(operator_input, min=-self.input_clip, max=self.input_clip)
+        operator_input = operator_input.transpose(0, 1).contiguous() if self.seq_first else operator_input
+        if self.training and self.force_fp32_train:
+            with torch.amp.autocast('cuda', enabled=False):
+                output = self.operator(operator_input.float())
+        else:
+            output = self.operator(operator_input)
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        if self.seq_first:
+            output = output.transpose(0, 1).contiguous()
+        output = torch.nan_to_num(output, nan=0.0, posinf=1e4, neginf=-1e4)
+        if self.output_clip is not None:
+            output = torch.clamp(output, min=-self.output_clip, max=self.output_clip)
+        if output.shape != x.shape:
+            raise RuntimeError(
+                f'FLA_GLA operator must preserve grouped token shape. Expected {tuple(x.shape)}, '
+                f'got {tuple(output.shape)}.'
+            )
+        return output
+
+
+def build_lion_operator(operator_cfg, dim, layer_id, n_layer):
+    operator_name = operator_cfg.NAME
+    if operator_name == 'Mamba':
+        mamba_block_cls = _resolve_mamba_block_cls()
+        mamba_cfg = copy.deepcopy(dict(operator_cfg.CFG))
+        mamba_cfg['d_model'] = dim
+        mamba_cfg['layer_id'] = layer_id
+        mamba_cfg['n_layer'] = n_layer
+        mamba_cfg['with_cp'] = layer_id >= 0
+        return mamba_block_cls(**mamba_cfg)
+
+    if operator_name == 'FLA_GLA':
+        fla_cfg = copy.deepcopy(dict(operator_cfg.get('FLA_CFG', {})))
+        fla_cfg.setdefault('num_heads', max(dim // 32, 1))
+        return FLAGatedLinearAttentionAdapter(d_model=dim, cfg=fla_cfg)
+
+    raise KeyError(f'Unsupported LION operator: {operator_name}')
 
 
 LinearOperatorMap = {
-    'Mamba': MambaBlock,
+    'Mamba': 'lazy_mamba',
+    'FLA_GLA': FLAGatedLinearAttentionAdapter,
 }
 
 
@@ -333,35 +486,35 @@ class LIONLayer(nn.Module):
         self.group_size = group_size
         self.dim = dim
         self.direction = direction
-
-        operator_cfg = operator.CFG
-        operator_cfg['d_model'] = dim
+        self.operator_name = operator.NAME
 
         block_list = []
         for i in range(len(direction)):
-            operator_cfg['layer_id'] = i + layer_id
-            operator_cfg['n_layer'] = n_layer
-            # operator_cfg['with_cp'] = layer_id >= 16
-            operator_cfg['with_cp'] = layer_id >= 0 ## all lion layer use checkpoint to save GPU memory!! (less 24G for training all models!!!)
-            print('### use part of checkpoint!!')
-            block_list.append(LinearOperatorMap[operator.NAME](**operator_cfg))
+            block_list.append(build_lion_operator(operator, dim, i + layer_id, n_layer))
 
         self.blocks = nn.ModuleList(block_list)
-        self.window_partition = FlattenedWindowMapping(self.window_shape, self.group_size, shift)
+        self.window_partition = FlattenedWindowMapping(
+            self.window_shape,
+            self.group_size,
+            shift,
+            use_fused_mapping=operator.get('USE_FUSED_MAPPING', False)
+        )
 
     def forward(self, x):
-        mappings = self.window_partition(x.indices, x.batch_size, x.spatial_shape)
+        with record_function('LION/LIONLayer'):
+            mappings = self.window_partition(x.indices, x.batch_size, x.spatial_shape)
 
-        for i, block in enumerate(self.blocks):
-            indices = mappings[self.direction[i]]
-            x_features = x.features[indices][mappings["flat2win"]]
-            x_features = x_features.view(-1, self.group_size, x.features.shape[-1])
+            for i, block in enumerate(self.blocks):
+                with record_function(f'LION/Operator/{self.direction[i]}'):
+                    indices = mappings[self.direction[i]]
+                    x_features = x.features[indices][mappings["flat2win"]]
+                    x_features = x_features.view(-1, self.group_size, x.features.shape[-1])
+                    with record_function('LION/Operator'):
+                        x_features = block(x_features)
+                    x_features = x_features.to(dtype=x.features.dtype)
+                    x.features[indices] = x_features.view(-1, x_features.shape[-1])[mappings["win2flat"]]
 
-            x_features = block(x_features)
-
-            x.features[indices] = x_features.view(-1, x_features.shape[-1])[mappings["win2flat"]]
-
-        return x
+            return x
 
 
 class PositionEmbeddingLearned(nn.Module):
@@ -416,8 +569,11 @@ class LIONBlock(nn.Module):
         index = []
 
         for idx, enc in enumerate(self.encoder):
-            pos_emb = self.get_pos_embed(spatial_shape=x.spatial_shape, coors=x.indices[:, 1:],
-                                         embed_layer=self.pos_emb_list[idx])
+            pos_emb = self.get_pos_embed(
+                spatial_shape=x.spatial_shape,
+                coors=x.indices[:, 1:],
+                embed_layer=self.pos_emb_list[idx]
+            )
 
             x = replace_feature(x, pos_emb + x.features)  # x + pos_emb
             x = enc(x)
@@ -557,73 +713,74 @@ class LION3DBackboneOneStride(nn.Module):
         }
 
     def forward(self, batch_dict):
-        if self.pc_type == 'Radar':
-            voxel_features = batch_dict['radar_voxel_features']
-            voxel_coords = batch_dict['radar_voxel_coords']
-        else:
-            voxel_features = batch_dict['voxel_features']
-            voxel_coords = batch_dict['voxel_coords']
-        batch_size = batch_dict['batch_size']
+        with record_function('LION/forward'):
+            if self.pc_type == 'Radar':
+                voxel_features = batch_dict['radar_voxel_features']
+                voxel_coords = batch_dict['radar_voxel_coords']
+            else:
+                voxel_features = batch_dict['voxel_features']
+                voxel_coords = batch_dict['voxel_coords']
+            batch_size = batch_dict['batch_size']
 
-        x = spconv.SparseConvTensor(
-            features=voxel_features,
-            indices=voxel_coords.int(),
-            spatial_shape=self.sparse_shape,
-            batch_size=batch_size
-        )
+            x = spconv.SparseConvTensor(
+                features=voxel_features,
+                indices=voxel_coords.int(),
+                spatial_shape=self.sparse_shape,
+                batch_size=batch_size
+            )
 
-        x = self.linear_1(x)
-        x1, _ = self.dow1(x)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
-        x = self.linear_2(x1)
-        x2, _ = self.dow2(x)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
-        x = self.linear_3(x2)
-        x3, _ = self.dow3(x)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
-        x = self.linear_4(x3)
-        x4, _ = self.dow4(x)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
-        x = self.linear_out(x4)
+            x = self.linear_1(x)
+            x1, _ = self.dow1(x)
+            x = self.linear_2(x1)
+            x2, _ = self.dow2(x)
+            x = self.linear_3(x2)
+            x3, _ = self.dow3(x)
+            x = self.linear_4(x3)
+            x4, _ = self.dow4(x)
+            x = self.linear_out(x4)
 
-        if self.pc_type == 'Radar':
-            batch_dict.update({
-                'radar_encoded_spconv_tensor': x,
-                'radar_encoded_spconv_tensor_stride': 1
-            })
+            if self.pc_type == 'Radar':
+                batch_dict.update({
+                    'radar_encoded_spconv_tensor': x,
+                    'radar_encoded_spconv_tensor_stride': 1
+                })
 
-            batch_dict.update({
-                'radar_multi_scale_3d_features': {
-                    'x_conv1': x1,
-                    'x_conv2': x2,
-                    'x_conv3': x3,
-                    'x_conv4': x4,
-                }
-            })
-            batch_dict.update({
-                'radar_multi_scale_3d_strides': {
-                    'x_conv1': torch.tensor([1,1,2], device=x1.features.device).float(),
-                    'x_conv2': torch.tensor([1,1,4], device=x1.features.device).float(),
-                    'x_conv3': torch.tensor([1,1,8], device=x1.features.device).float(),
-                    'x_conv4': torch.tensor([1,1,16], device=x1.features.device).float(),
-                }
-            })
-        else:
-            batch_dict.update({
-                'encoded_spconv_tensor': x,
-                'encoded_spconv_tensor_stride': 1
-            })
+                batch_dict.update({
+                    'radar_multi_scale_3d_features': {
+                        'x_conv1': x1,
+                        'x_conv2': x2,
+                        'x_conv3': x3,
+                        'x_conv4': x4,
+                    }
+                })
+                batch_dict.update({
+                    'radar_multi_scale_3d_strides': {
+                        'x_conv1': torch.tensor([1,1,2], device=x1.features.device).float(),
+                        'x_conv2': torch.tensor([1,1,4], device=x1.features.device).float(),
+                        'x_conv3': torch.tensor([1,1,8], device=x1.features.device).float(),
+                        'x_conv4': torch.tensor([1,1,16], device=x1.features.device).float(),
+                    }
+                })
+            else:
+                batch_dict.update({
+                    'encoded_spconv_tensor': x,
+                    'encoded_spconv_tensor_stride': 1
+                })
 
-            batch_dict.update({
-                'multi_scale_3d_features': {
-                    'x_conv1': x1,
-                    'x_conv2': x2,
-                    'x_conv3': x3,
-                    'x_conv4': x4,
-                }
-            })
-            batch_dict.update({
-                'multi_scale_3d_strides': {
-                    'x_conv1': torch.tensor([1,1,2], device=x1.features.device).float(),
-                    'x_conv2': torch.tensor([1,1,4], device=x1.features.device).float(),
-                    'x_conv3': torch.tensor([1,1,8], device=x1.features.device).float(),
-                    'x_conv4': torch.tensor([1,1,16], device=x1.features.device).float(),
-                }
-            })
-        return batch_dict
+                batch_dict.update({
+                    'multi_scale_3d_features': {
+                        'x_conv1': x1,
+                        'x_conv2': x2,
+                        'x_conv3': x3,
+                        'x_conv4': x4,
+                    }
+                })
+                batch_dict.update({
+                    'multi_scale_3d_strides': {
+                        'x_conv1': torch.tensor([1,1,2], device=x1.features.device).float(),
+                        'x_conv2': torch.tensor([1,1,4], device=x1.features.device).float(),
+                        'x_conv3': torch.tensor([1,1,8], device=x1.features.device).float(),
+                        'x_conv4': torch.tensor([1,1,16], device=x1.features.device).float(),
+                    }
+                })
+            return batch_dict

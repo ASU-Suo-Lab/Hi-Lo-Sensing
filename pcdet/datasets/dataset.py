@@ -82,10 +82,15 @@ class DatasetTemplate(torch_data.Dataset):
             }
             return ret_dict
 
+        def tensor_to_numpy_export(tensor):
+            if tensor.is_floating_point() and tensor.dtype in (torch.float16, torch.bfloat16):
+                tensor = tensor.float()
+            return tensor.cpu().numpy()
+
         def generate_single_sample_dict(box_dict):
-            pred_scores = box_dict['pred_scores'].cpu().numpy()
-            pred_boxes = box_dict['pred_boxes'].cpu().numpy()
-            pred_labels = box_dict['pred_labels'].cpu().numpy()
+            pred_scores = tensor_to_numpy_export(box_dict['pred_scores'])
+            pred_boxes = tensor_to_numpy_export(box_dict['pred_boxes'])
+            pred_labels = tensor_to_numpy_export(box_dict['pred_labels'])
             pred_dict = get_template_prediction(pred_scores.shape[0])
             if pred_scores.shape[0] == 0:
                 return pred_dict

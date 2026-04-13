@@ -5,7 +5,10 @@ import copy
 import numpy as np
 from skimage import io
 import torch
-import SharedArray
+try:
+    import SharedArray
+except ImportError:
+    SharedArray = None
 import torch.distributed as dist
 
 from ...ops.iou3d_nms import iou3d_nms_utils
@@ -27,6 +30,8 @@ class DataBaseSampler(object):
             self.db_infos[class_name] = []
 
         self.use_shared_memory = sampler_cfg.get('USE_SHARED_MEMORY', False)
+        if self.use_shared_memory and SharedArray is None:
+            raise ImportError('SharedArray is required when USE_SHARED_MEMORY=True')
 
         for db_info_path in sampler_cfg.DB_INFO_PATH:
             db_info_path = self.root_path.resolve() / db_info_path
@@ -83,6 +88,8 @@ class DataBaseSampler(object):
 
     def load_db_to_shared_memory(self):
         self.logger.info('Loading GT database to shared memory')
+        if SharedArray is None:
+            raise ImportError('SharedArray is required when USE_SHARED_MEMORY=True')
         cur_rank, world_size, num_gpus = common_utils.get_dist_info(return_gpu_per_machine=True)
 
         assert self.sampler_cfg.DB_DATA_PATH.__len__() == 1, 'Current only support single DB_DATA'

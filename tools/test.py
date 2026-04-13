@@ -40,6 +40,8 @@ def parse_config():
     parser.add_argument('--ckpt_dir', type=str, default=None, help='specify a ckpt directory to be evaluated if needed')
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     parser.add_argument('--infer_time', action='store_true', default=False, help='calculate inference latency')
+    parser.add_argument('--use_amp', action='store_true', help='use mix precision inference')
+    parser.add_argument('--amp_dtype', choices=['fp16', 'bf16'], default=None, help='mixed precision dtype for inference')
 
     args = parser.parse_args()
 
@@ -51,6 +53,18 @@ def parse_config():
 
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
+
+    args.use_amp = args.use_amp or cfg.OPTIMIZATION.get('USE_AMP', False)
+    args.amp_dtype = args.amp_dtype or cfg.OPTIMIZATION.get('AMP_DTYPE', 'fp16')
+    is_lion_backbone = cfg.MODEL.get('BACKBONE_3D', {}).get('NAME', None) == 'LION3DBackboneOneStride'
+    fla_cfg = cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('FLA_CFG', {})
+    if is_lion_backbone:
+        args.use_amp = False
+    elif (
+        cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('NAME', None) == 'FLA_GLA'
+        and fla_cfg.get('disable_global_amp_eval', False)
+    ):
+        args.use_amp = False
 
     return args, cfg
 
@@ -187,6 +201,15 @@ def main():
         logger.info('total_batch_size: %d' % (total_gpus * args.batch_size))
     for key, val in vars(args).items():
         logger.info('{:16} {}'.format(key, val))
+    if cfg.MODEL.get('BACKBONE_3D', {}).get('NAME', None) == 'LION3DBackboneOneStride':
+        logger.info('LION evaluation stability mode: disable global AMP because current spconv ops do not support bf16.')
+    fla_cfg = cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('FLA_CFG', {})
+    if (
+        cfg.MODEL.get('BACKBONE_3D', {}).get('NAME', None) != 'LION3DBackboneOneStride'
+        and cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('NAME', None) == 'FLA_GLA'
+        and fla_cfg.get('disable_global_amp_eval', False)
+    ):
+        logger.info('FLA_GLA evaluation stability mode: disable global AMP to avoid unsupported bf16 spconv ops.')
     log_config_to_file(cfg, logger=logger)
 
     ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else output_dir / 'ckpt'

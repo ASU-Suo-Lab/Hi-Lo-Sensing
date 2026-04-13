@@ -70,11 +70,23 @@ MODEL:
         SHIFT: True
         OPERATOR:
           NAME: 'Mamba'
+          USE_FUSED_MAPPING: False
           CFG:
             d_state: 16
             d_conv: 4
             expand: 2
             drop_path: 0.2
+          FLA_CFG:
+            seq_first: True
+            num_heads: 8
+            expand_k: 1.0
+            expand_v: 1.0
+            use_short_conv: False
+            disable_global_amp_train: True
+            disable_global_amp_eval: True
+            force_fp32_train: True
+            input_clip: 100.0
+            output_clip: 100.0
 
 
     MAP_TO_BEV:
@@ -186,7 +198,10 @@ OPTIMIZATION:
     WARMUP_EPOCH: 1
 
     GRAD_NORM_CLIP: 35
+    GRAD_VALUE_CLIP: 100
     LOSS_SCALE_FP16: 4.0
+    USE_AMP: True
+    AMP_DTYPE: bf16
 
 HOOK:
     DisableAugmentationHook:

@@ -1,10 +1,232 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from math import ceil
+from contextlib import nullcontext
 
-from pcdet.models.model_utils.dsvt_utils import get_window_coors, get_inner_win_inds_cuda, get_pooling_index, get_continous_inds
+try:
+    from torch.profiler import record_function
+except ImportError:
+    from torch.autograd.profiler import record_function
+
+try:
+    from torch.backends.cuda import sdp_kernel as cuda_sdp_kernel
+except ImportError:
+    cuda_sdp_kernel = None
+
+from pcdet.models.model_utils.dsvt_utils import get_window_coors, get_inner_win_inds_cuda, get_pooling_index, get_continous_inds, fused_get_set_single_shift
 from pcdet.models.model_utils.dsvt_utils import PositionEmbeddingLearned
+
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import pad_input
+except ImportError:
+    flash_attn_func = None
+    flash_attn_varlen_func = None
+    pad_input = None
+
+
+def _get_sdpa_context(force_flash, tensor):
+    if not force_flash:
+        return nullcontext()
+
+    if not tensor.is_cuda:
+        raise RuntimeError('ATTN_FORCE_FLASH requires CUDA tensors')
+
+    if cuda_sdp_kernel is None:
+        raise RuntimeError('ATTN_FORCE_FLASH is not supported by this PyTorch build')
+
+    return cuda_sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)
+
+
+def _reshape_for_heads(x, num_heads):
+    batch_size, seq_len, embed_dim = x.shape
+    head_dim = embed_dim // num_heads
+    return x.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+
+
+def _mha_forward_with_sdpa(mha_module, query, key, value, key_padding_mask=None, force_flash=False):
+    if not mha_module.batch_first:
+        raise NotImplementedError('SDPA path currently expects batch_first=True')
+
+    q_weight, k_weight, v_weight = mha_module.in_proj_weight.chunk(3, dim=0)
+    if mha_module.in_proj_bias is not None:
+        q_bias, k_bias, v_bias = mha_module.in_proj_bias.chunk(3, dim=0)
+    else:
+        q_bias = k_bias = v_bias = None
+
+    query = F.linear(query, q_weight, q_bias)
+    key = F.linear(key, k_weight, k_bias)
+    value = F.linear(value, v_weight, v_bias)
+
+    query = _reshape_for_heads(query, mha_module.num_heads)
+    key = _reshape_for_heads(key, mha_module.num_heads)
+    value = _reshape_for_heads(value, mha_module.num_heads)
+
+    attn_mask = None
+    if key_padding_mask is not None:
+        key_padding_mask = key_padding_mask.to(torch.bool)
+        attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(1)
+
+    dropout_p = mha_module.dropout if mha_module.training else 0.0
+    with _get_sdpa_context(force_flash, query):
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=False
+        )
+
+    output = output.transpose(1, 2).contiguous().view(query.shape[0], -1, mha_module.embed_dim)
+    return mha_module.out_proj(output)
+
+
+def _get_flash_attn_packed_input(x, valid_mask=None):
+    batch_size, seqlen = x.shape[:2]
+    if valid_mask is None or bool(valid_mask.all().item()):
+        cu_seqlens = torch.arange(
+            0,
+            (batch_size + 1) * seqlen,
+            step=seqlen,
+            device=x.device,
+            dtype=torch.int32
+        )
+        return x.reshape(batch_size * seqlen, *x.shape[2:]), None, cu_seqlens, seqlen
+
+    indices = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+    seqlens = valid_mask.sum(dim=-1, dtype=torch.int32)
+    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    max_seqlen = int(seqlens.max().item())
+    x_unpad = x.reshape(batch_size * seqlen, *x.shape[2:])[indices]
+    return x_unpad, indices, cu_seqlens, max_seqlen
+
+
+def _mha_forward_with_flash_attn(mha_module, query, key, value, key_padding_mask=None):
+    if flash_attn_func is None or flash_attn_varlen_func is None or pad_input is None:
+        raise ImportError('flash-attn is not installed, but ATTN_BACKEND=flash_attn was requested')
+
+    if not mha_module.batch_first:
+        raise NotImplementedError('flash-attn path currently expects batch_first=True')
+    if not query.is_cuda or not key.is_cuda or not value.is_cuda:
+        raise RuntimeError('flash-attn backend requires CUDA tensors')
+
+    q_weight, k_weight, v_weight = mha_module.in_proj_weight.chunk(3, dim=0)
+    if mha_module.in_proj_bias is not None:
+        q_bias, k_bias, v_bias = mha_module.in_proj_bias.chunk(3, dim=0)
+    else:
+        q_bias = k_bias = v_bias = None
+
+    query = F.linear(query, q_weight, q_bias)
+    key = F.linear(key, k_weight, k_bias)
+    value = F.linear(value, v_weight, v_bias)
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            f'flash-attn backend requires fp16/bf16 projected QKV, but received {query.dtype}. '
+            'Enable AMP with fp16 or bf16.'
+        )
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise RuntimeError(
+            f'flash-attn backend requires matching QKV dtypes, but received '
+            f'Q={query.dtype}, K={key.dtype}, V={value.dtype}.'
+        )
+
+    batch_size, seqlen_q, _ = query.shape
+    seqlen_k = key.shape[1]
+    query = _reshape_for_heads(query, mha_module.num_heads).transpose(1, 2).contiguous()
+    key = _reshape_for_heads(key, mha_module.num_heads).transpose(1, 2).contiguous()
+    value = _reshape_for_heads(value, mha_module.num_heads).transpose(1, 2).contiguous()
+
+    dropout_p = mha_module.dropout if mha_module.training else 0.0
+    if key_padding_mask is None:
+        output = flash_attn_func(query, key, value, dropout_p=dropout_p, causal=False)
+    else:
+        key_valid_mask = (~key_padding_mask.to(torch.bool)).contiguous()
+        if key_valid_mask.shape != (batch_size, seqlen_k):
+            raise RuntimeError(
+                f'flash-attn backend expected key_padding_mask shape {(batch_size, seqlen_k)}, '
+                f'but received {tuple(key_valid_mask.shape)}'
+            )
+
+        query_valid_mask = key_valid_mask if seqlen_q == seqlen_k else None
+        query_unpad, indices_q, cu_seqlens_q, max_seqlen_q = _get_flash_attn_packed_input(query, query_valid_mask)
+        key_unpad, _, cu_seqlens_k, max_seqlen_k = _get_flash_attn_packed_input(key, key_valid_mask)
+        value_unpad, _, _, _ = _get_flash_attn_packed_input(value, key_valid_mask)
+        output_unpad = flash_attn_varlen_func(
+            query_unpad,
+            key_unpad,
+            value_unpad,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            causal=False
+        )
+        if indices_q is None:
+            output = output_unpad.view(batch_size, seqlen_q, mha_module.num_heads, -1)
+        else:
+            output = pad_input(output_unpad, indices_q, batch_size, seqlen_q)
+
+    output = output.contiguous().view(batch_size, seqlen_q, mha_module.embed_dim)
+    return mha_module.out_proj(output)
+
+
+def _mha_forward_with_flash_attn_varlen(
+    mha_module,
+    query,
+    key,
+    value,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k
+):
+    if flash_attn_varlen_func is None:
+        raise ImportError('flash-attn is not installed, but ATTN_BACKEND=flash_attn was requested')
+
+    q_weight, k_weight, v_weight = mha_module.in_proj_weight.chunk(3, dim=0)
+    if mha_module.in_proj_bias is not None:
+        q_bias, k_bias, v_bias = mha_module.in_proj_bias.chunk(3, dim=0)
+    else:
+        q_bias = k_bias = v_bias = None
+
+    query = F.linear(query, q_weight, q_bias)
+    key = F.linear(key, k_weight, k_bias)
+    value = F.linear(value, v_weight, v_bias)
+
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            f'flash-attn backend requires fp16/bf16 projected QKV, but received {query.dtype}. '
+            'Enable AMP with fp16 or bf16.'
+        )
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise RuntimeError(
+            f'flash-attn backend requires matching QKV dtypes, but received '
+            f'Q={query.dtype}, K={key.dtype}, V={value.dtype}.'
+        )
+
+    head_dim = mha_module.embed_dim // mha_module.num_heads
+    query = query.view(-1, mha_module.num_heads, head_dim).contiguous()
+    key = key.view(-1, mha_module.num_heads, head_dim).contiguous()
+    value = value.view(-1, mha_module.num_heads, head_dim).contiguous()
+
+    dropout_p = mha_module.dropout if mha_module.training else 0.0
+    output = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dropout_p=dropout_p,
+        causal=False
+    )
+    output = output.view(-1, mha_module.embed_dim).contiguous()
+    return mha_module.out_proj(output)
 
 
 class DSVT(nn.Module):
@@ -31,7 +253,13 @@ class DSVT(nn.Module):
 
         self.model_cfg = model_cfg
         self.pc_type = model_cfg.TYPE
-        self.input_layer = DSVTInputLayer(self.model_cfg.INPUT_LAYER,self.pc_type)
+        self.attn_backend = self.model_cfg.get('ATTN_BACKEND', 'sdpa')
+        self.attn_force_flash = self.model_cfg.get('ATTN_FORCE_FLASH', False)
+        self.input_layer = DSVTInputLayer(
+            self.model_cfg.INPUT_LAYER,
+            self.pc_type,
+            attn_backend=self.attn_backend
+        )
         block_name = self.model_cfg.block_name
         set_info = self.model_cfg.set_info
         d_model = self.model_cfg.d_model
@@ -42,6 +270,9 @@ class DSVT(nn.Module):
         self.reduction_type = self.model_cfg.get('reduction_type', 'attention')
         # save GPU memory
         self.use_torch_ckpt = self.model_cfg.get('USE_CHECKPOINT', False)
+
+        if self.attn_backend not in ['sdpa', 'mha_legacy', 'flash_attn']:
+            raise ValueError(f'Unsupported ATTN_BACKEND: {self.attn_backend}')
  
         # Sparse Regional Attention Blocks
         stage_num = len(block_name)
@@ -57,7 +288,9 @@ class DSVT(nn.Module):
             for i in range(num_blocks_this_stage):
                 block_list.append(
                     block_module(dmodel_this_stage, num_head_this_stage, dfeed_this_stage,
-                                 dropout, activation, batch_first=True)
+                                 dropout, activation, batch_first=True,
+                                 attn_backend=self.attn_backend,
+                                 attn_force_flash=self.attn_force_flash)
                 )
                 norm_list.append(nn.LayerNorm(dmodel_this_stage))
             self.__setattr__(f'stage_{stage_id}', nn.ModuleList(block_list))
@@ -74,7 +307,15 @@ class DSVT(nn.Module):
                 elif self.reduction_type == 'maxpool':
                     self.__setattr__(f'stage_{stage_id}_reduction', torch.nn.MaxPool1d(pool_volume))
                 elif self.reduction_type == 'attention':
-                    self.__setattr__(f'stage_{stage_id}_reduction', Stage_ReductionAtt_Block(dmodel_this_stage, pool_volume))
+                    self.__setattr__(
+                        f'stage_{stage_id}_reduction',
+                        Stage_ReductionAtt_Block(
+                            dmodel_this_stage,
+                            pool_volume,
+                            attn_backend=self.attn_backend,
+                            attn_force_flash=self.attn_force_flash
+                        )
+                    )
                 else:
                     raise NotImplementedError
 
@@ -104,51 +345,70 @@ class DSVT(nn.Module):
                 - voxel_coords (Tensor[int]):
                 - ...
         '''
-        voxel_info = self.input_layer(batch_dict)
+        with record_function('DSVT/forward'):
+            voxel_info = self.input_layer(batch_dict)
 
-        voxel_feat = voxel_info['voxel_feats_stage0']
-        set_voxel_inds_list = [[voxel_info[f'set_voxel_inds_stage{s}_shift{i}'] for i in range(self.num_shifts[s])] for s in range(self.stage_num)]
-        set_voxel_masks_list = [[voxel_info[f'set_voxel_mask_stage{s}_shift{i}'] for i in range(self.num_shifts[s])] for s in range(self.stage_num)]
-        pos_embed_list = [[[voxel_info[f'pos_embed_stage{s}_block{b}_shift{i}'] for i in range(self.num_shifts[s])] for b in range(self.set_info[s][1])] for s in range(self.stage_num)]
-        pooling_mapping_index = [voxel_info[f'pooling_mapping_index_stage{s+1}'] for s in range(self.stage_num-1)]
-        pooling_index_in_pool = [voxel_info[f'pooling_index_in_pool_stage{s+1}'] for s in range(self.stage_num-1)]
-        pooling_preholder_feats = [voxel_info[f'pooling_preholder_feats_stage{s+1}'] for s in range(self.stage_num-1)]
+            voxel_feat = voxel_info['voxel_feats_stage0']
+            set_voxel_inds_list = [[voxel_info[f'set_voxel_inds_stage{s}_shift{i}'] for i in range(self.num_shifts[s])] for s in range(self.stage_num)]
+            set_voxel_masks_list = [[voxel_info[f'set_voxel_mask_stage{s}_shift{i}'] for i in range(self.num_shifts[s])] for s in range(self.stage_num)]
+            set_voxel_packed_list = None
+            if self.attn_backend == 'flash_attn':
+                set_voxel_packed_list = [
+                    [voxel_info[f'set_voxel_packed_stage{s}_shift{i}'] for i in range(self.num_shifts[s])]
+                    for s in range(self.stage_num)
+                ]
+            pos_embed_list = [[[voxel_info[f'pos_embed_stage{s}_block{b}_shift{i}'] for i in range(self.num_shifts[s])] for b in range(self.set_info[s][1])] for s in range(self.stage_num)]
+            pooling_mapping_index = [voxel_info[f'pooling_mapping_index_stage{s+1}'] for s in range(self.stage_num-1)]
+            pooling_index_in_pool = [voxel_info[f'pooling_index_in_pool_stage{s+1}'] for s in range(self.stage_num-1)]
+            pooling_preholder_feats = [voxel_info[f'pooling_preholder_feats_stage{s+1}'] for s in range(self.stage_num-1)]
 
-        output = voxel_feat
-        block_id = 0
-        for stage_id in range(self.stage_num):
-            block_layers = self.__getattr__(f'stage_{stage_id}')
-            residual_norm_layers = self.__getattr__(f'residual_norm_stage_{stage_id}')
-            for i in range(len(block_layers)):
-                block = block_layers[i]
-                residual = output.clone()
-                if self.use_torch_ckpt==False:
-                    output = block(output, set_voxel_inds_list[stage_id], set_voxel_masks_list[stage_id], pos_embed_list[stage_id][i], \
-                                block_id=block_id)
-                else:
-                    output = checkpoint(block, output, set_voxel_inds_list[stage_id], set_voxel_masks_list[stage_id], pos_embed_list[stage_id][i], block_id)
-                output = residual_norm_layers[i](output + residual)
-                block_id += 1
-            if stage_id < self.stage_num - 1:
-                # pooling
-                prepool_features = pooling_preholder_feats[stage_id].type_as(output)
-                pooled_voxel_num = prepool_features.shape[0]
-                pool_volume = prepool_features.shape[1]
-                prepool_features[pooling_mapping_index[stage_id], pooling_index_in_pool[stage_id]] = output
-                prepool_features = prepool_features.view(prepool_features.shape[0], -1)
-                
-                if self.reduction_type == 'linear':
-                    output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features)
-                elif self.reduction_type == 'maxpool':
-                    prepool_features = prepool_features.view(pooled_voxel_num, pool_volume, -1).permute(0, 2, 1)
-                    output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features).squeeze(-1)
-                elif self.reduction_type == 'attention':
-                    prepool_features = prepool_features.view(pooled_voxel_num, pool_volume, -1).permute(0, 2, 1)
-                    key_padding_mask = torch.zeros((pooled_voxel_num, pool_volume)).to(prepool_features.device).bool()
-                    # key_padding_mask = torch.zeros((pooled_voxel_num, pool_volume)).to(prepool_features.device).int()
-                    output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features, key_padding_mask)
-                else:
-                    raise NotImplementedError
+            output = voxel_feat
+            block_id = 0
+            for stage_id in range(self.stage_num):
+                block_layers = self.__getattr__(f'stage_{stage_id}')
+                residual_norm_layers = self.__getattr__(f'residual_norm_stage_{stage_id}')
+                for i in range(len(block_layers)):
+                    block = block_layers[i]
+                    residual = output
+                    if self.use_torch_ckpt == False:
+                        output = block(
+                            output,
+                            set_voxel_inds_list[stage_id],
+                            set_voxel_masks_list[stage_id],
+                            None if set_voxel_packed_list is None else set_voxel_packed_list[stage_id],
+                            pos_embed_list[stage_id][i],
+                            block_id=block_id
+                        )
+                    else:
+                        output = checkpoint(
+                            block,
+                            output,
+                            set_voxel_inds_list[stage_id],
+                            set_voxel_masks_list[stage_id],
+                            None if set_voxel_packed_list is None else set_voxel_packed_list[stage_id],
+                            pos_embed_list[stage_id][i],
+                            block_id
+                        )
+                    output = residual_norm_layers[i](output + residual)
+                    block_id += 1
+                if stage_id < self.stage_num - 1:
+                    prepool_features = pooling_preholder_feats[stage_id].type_as(output)
+                    pooled_voxel_num = prepool_features.shape[0]
+                    pool_volume = prepool_features.shape[1]
+                    prepool_features[pooling_mapping_index[stage_id], pooling_index_in_pool[stage_id]] = output
+                    prepool_features = prepool_features.view(prepool_features.shape[0], -1)
+                    
+                    if self.reduction_type == 'linear':
+                        output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features)
+                    elif self.reduction_type == 'maxpool':
+                        prepool_features = prepool_features.view(pooled_voxel_num, pool_volume, -1).permute(0, 2, 1)
+                        output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features).squeeze(-1)
+                    elif self.reduction_type == 'attention':
+                        prepool_features = prepool_features.view(pooled_voxel_num, pool_volume, -1).permute(0, 2, 1)
+                        key_padding_mask = torch.zeros((pooled_voxel_num, pool_volume), device=prepool_features.device, dtype=torch.bool)
+                        output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features, key_padding_mask)
+                    else:
+                        raise NotImplementedError
 
         if self.pc_type == 'Radar':
             batch_dict['radar_pillar_features'] = batch_dict['radar_voxel_features'] = output
@@ -168,13 +428,15 @@ class DSVTBlock(nn.Module):
     ''' Consist of two encoder layer, shift and shift back.
     '''
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", batch_first=True):
+                 activation="relu", batch_first=True, attn_backend='sdpa', attn_force_flash=False):
         super().__init__()
 
         encoder_1 = DSVT_EncoderLayer(d_model, nhead, dim_feedforward, dropout,
-                                        activation, batch_first)
+                                        activation, batch_first, attn_backend=attn_backend,
+                                        attn_force_flash=attn_force_flash)
         encoder_2 = DSVT_EncoderLayer(d_model, nhead, dim_feedforward, dropout,
-                                        activation, batch_first)
+                                        activation, batch_first, attn_backend=attn_backend,
+                                        attn_force_flash=attn_force_flash)
         self.encoder_list = nn.ModuleList([encoder_1, encoder_2])
 
     def forward(
@@ -182,6 +444,7 @@ class DSVTBlock(nn.Module):
             src,
             set_voxel_inds_list,
             set_voxel_masks_list,
+            set_voxel_packed_list,
             pos_embed_list,
             block_id,
     ):
@@ -194,9 +457,10 @@ class DSVTBlock(nn.Module):
             pos_embed_id = i
             set_voxel_inds = set_voxel_inds_list[shift_id][set_id]
             set_voxel_masks = set_voxel_masks_list[shift_id][set_id]
+            set_voxel_packed = None if set_voxel_packed_list is None else set_voxel_packed_list[shift_id][set_id]
             pos_embed = pos_embed_list[pos_embed_id]
             layer = self.encoder_list[i]
-            output = layer(output, set_voxel_inds, set_voxel_masks, pos_embed)
+            output = layer(output, set_voxel_inds, set_voxel_masks, pos_embed, set_voxel_packed)
 
         return output
 
@@ -204,15 +468,19 @@ class DSVTBlock(nn.Module):
 class DSVT_EncoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", batch_first=True, mlp_dropout=0):
+                 activation="relu", batch_first=True, mlp_dropout=0,
+                 attn_backend='sdpa', attn_force_flash=False):
         super().__init__()
-        self.win_attn = SetAttention(d_model, nhead, dropout, dim_feedforward, activation, batch_first, mlp_dropout)
+        self.win_attn = SetAttention(
+            d_model, nhead, dropout, dim_feedforward, activation, batch_first, mlp_dropout,
+            attn_backend=attn_backend, attn_force_flash=attn_force_flash
+        )
         self.norm = nn.LayerNorm(d_model)
         self.d_model = d_model
 
-    def forward(self,src,set_voxel_inds,set_voxel_masks,pos=None):
+    def forward(self,src,set_voxel_inds,set_voxel_masks,pos=None,set_voxel_packed=None):
         identity = src
-        src = self.win_attn(src, pos, set_voxel_masks, set_voxel_inds)
+        src = self.win_attn(src, pos, set_voxel_masks, set_voxel_inds, set_voxel_packed)
         src = src + identity
         src = self.norm(src)
 
@@ -220,9 +488,12 @@ class DSVT_EncoderLayer(nn.Module):
 
 class SetAttention(nn.Module):
 
-    def __init__(self, d_model, nhead, dropout, dim_feedforward=2048, activation="relu", batch_first=True, mlp_dropout=0):
+    def __init__(self, d_model, nhead, dropout, dim_feedforward=2048, activation="relu",
+                 batch_first=True, mlp_dropout=0, attn_backend='sdpa', attn_force_flash=False):
         super().__init__()
         self.nhead = nhead
+        self.attn_backend = attn_backend
+        self.attn_force_flash = attn_force_flash
         if batch_first:
             self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
         else:
@@ -240,7 +511,7 @@ class SetAttention(nn.Module):
 
         self.activation = _get_activation_fn(activation)
 
-    def forward(self, src, pos=None, key_padding_mask=None, voxel_inds=None):
+    def forward(self, src, pos=None, key_padding_mask=None, voxel_inds=None, packed_metadata=None):
         '''
         Args:
             src (Tensor[float]): Voxel features with shape (N, C), where N is the number of voxels.
@@ -250,28 +521,65 @@ class SetAttention(nn.Module):
         Returns:
             src (Tensor[float]): Voxel features.
         '''
-        set_features = src[voxel_inds]
-        if pos is not None:
-            set_pos = pos[voxel_inds]
-        else:
-            set_pos = None
-        if pos is not None:
-            query = set_features + set_pos
-            key = set_features + set_pos
-            value = set_features
+        with record_function('DSVT/SetAttention'):
+            if self.attn_backend == 'flash_attn':
+                if packed_metadata is None:
+                    raise RuntimeError('flash_attn backend requires packed set metadata')
 
-        if key_padding_mask is not None:
-            src2 = self.self_attn(query, key, value, key_padding_mask)[0]
-        else:
-            src2 = self.self_attn(query, key, value)[0]
+                token_indices = packed_metadata['token_indices']
+                set_features = src[token_indices]
+                if pos is not None:
+                    set_pos = pos[token_indices]
+                    query = set_features + set_pos
+                    key = set_features + set_pos
+                else:
+                    query = key = set_features
+                value = set_features
+                src2 = _mha_forward_with_flash_attn_varlen(
+                    self.self_attn,
+                    query,
+                    key,
+                    value,
+                    cu_seqlens_q=packed_metadata['cu_seqlens'],
+                    cu_seqlens_k=packed_metadata['cu_seqlens'],
+                    max_seqlen_q=packed_metadata['max_seqlen'],
+                    max_seqlen_k=packed_metadata['max_seqlen']
+                )
+                packed_output = src2.index_select(0, packed_metadata['restore_perm'])
+                output_voxel_inds = packed_metadata['output_voxel_inds']
+                if packed_metadata['output_complete']:
+                    src2 = packed_output
+                else:
+                    src2 = src.new_zeros(src.shape)
+                    src2.index_copy_(0, output_voxel_inds, packed_output)
+            else:
+                set_features = src[voxel_inds]
+                if pos is not None:
+                    set_pos = pos[voxel_inds]
+                    query = set_features + set_pos
+                    key = set_features + set_pos
+                else:
+                    query = key = set_features
+                value = set_features
 
-        # map voxel featurs from set space to voxel space: (set_num, set_size, C) --> (N, C)
-        flatten_inds = voxel_inds.reshape(-1)
-        unique_flatten_inds, inverse = torch.unique(flatten_inds, return_inverse=True)
-        perm = torch.arange(inverse.size(0), dtype=inverse.dtype, device=inverse.device)
-        inverse, perm = inverse.flip([0]), perm.flip([0])
-        perm = inverse.new_empty(unique_flatten_inds.size(0)).scatter_(0, inverse, perm)
-        src2 = src2.reshape(-1, self.d_model)[perm]
+            if self.attn_backend == 'sdpa':
+                src2 = _mha_forward_with_sdpa(
+                    self.self_attn, query, key, value,
+                    key_padding_mask=key_padding_mask,
+                    force_flash=self.attn_force_flash
+                )
+            elif self.attn_backend == 'mha_legacy' and key_padding_mask is not None:
+                src2 = self.self_attn(query, key, value, key_padding_mask=key_padding_mask)[0]
+            elif self.attn_backend == 'mha_legacy':
+                src2 = self.self_attn(query, key, value)[0]
+
+            if self.attn_backend != 'flash_attn':
+                flatten_inds = voxel_inds.reshape(-1)
+                unique_flatten_inds, inverse = torch.unique(flatten_inds, return_inverse=True)
+                perm = torch.arange(inverse.size(0), dtype=inverse.dtype, device=inverse.device)
+                inverse, perm = inverse.flip([0]), perm.flip([0])
+                perm = inverse.new_empty(unique_flatten_inds.size(0)).scatter_(0, inverse, perm)
+                src2 = src2.reshape(-1, self.d_model)[perm]
 
         # FFN layer
         src = src + self.dropout1(src2)
@@ -296,9 +604,11 @@ class Stage_Reduction_Block(nn.Module):
 
 
 class Stage_ReductionAtt_Block(nn.Module):
-    def __init__(self, input_channel, pool_volume):
+    def __init__(self, input_channel, pool_volume, attn_backend='sdpa', attn_force_flash=False):
         super().__init__()
         self.pool_volume = pool_volume
+        self.attn_backend = attn_backend
+        self.attn_force_flash = attn_force_flash
         self.query_func = torch.nn.MaxPool1d(pool_volume)
         self.norm = nn.LayerNorm(input_channel)
         self.self_attn = nn.MultiheadAttention(input_channel, 8, batch_first=True)
@@ -307,13 +617,26 @@ class Stage_ReductionAtt_Block(nn.Module):
 
     def forward(self, x, key_padding_mask):
         # x: [voxel_num, c_dim, pool_volume]
-        src = self.query_func(x).permute(0, 2, 1)  # voxel_num, 1, c_dim
-        key = value = x.permute(0, 2, 1)
-        key = key + self.pos_embedding.unsqueeze(0).repeat(src.shape[0], 1, 1)
-        query = src.clone()
-        output = self.self_attn(query, key, value, key_padding_mask)[0]
-        src = self.norm(output + src).squeeze(1)
-        return src
+        with record_function('DSVT/StageReductionAttention'):
+            src = self.query_func(x).permute(0, 2, 1)  # voxel_num, 1, c_dim
+            key = value = x.permute(0, 2, 1)
+            key = key + self.pos_embedding.unsqueeze(0).repeat(src.shape[0], 1, 1)
+            query = src
+            if self.attn_backend == 'sdpa':
+                output = _mha_forward_with_sdpa(
+                    self.self_attn, query, key, value,
+                    key_padding_mask=key_padding_mask,
+                    force_flash=self.attn_force_flash
+                )
+            elif self.attn_backend == 'flash_attn':
+                output = _mha_forward_with_flash_attn(
+                    self.self_attn, query, key, value,
+                    key_padding_mask=key_padding_mask
+                )
+            else:
+                output = self.self_attn(query, key, value, key_padding_mask=key_padding_mask)[0]
+            src = self.norm(output + src).squeeze(1)
+            return src
 
 
 def _get_activation_fn(activation):
@@ -358,10 +681,13 @@ class DSVTInputLayer(nn.Module):
         shift_list (list): Shift window. Length: stage_num.
         normalize_pos (bool): Whether to normalize coordinates in position embedding.
     '''
-    def __init__(self, model_cfg, pc_type):
+    def __init__(self, model_cfg, pc_type, attn_backend='sdpa'):
         super().__init__()
         self.pc_type =pc_type
+        self.attn_backend = attn_backend
+        self.enable_packed_flash_attn = attn_backend == 'flash_attn'
         self.model_cfg = model_cfg 
+        self.use_fused_get_set = self.model_cfg.get('USE_FUSED_GET_SET', self.enable_packed_flash_attn) and fused_get_set_single_shift is not None
         self.sparse_shape = self.model_cfg.sparse_shape
         self.window_shape = self.model_cfg.window_shape
         self.downsample_stride = self.model_cfg.downsample_stride
@@ -424,32 +750,30 @@ class DSVTInputLayer(nn.Module):
                     Shape of (N_{i}, downsample_stride[i-1].prob(), d_moel[i-1]), where prob() returns the product of all elements.
                 - ...
         '''
-        if self.pc_type =='Radar':
-            voxel_feats = batch_dict['radar_voxel_features']
-            voxel_coors = batch_dict['radar_voxel_coords'].long()
-        else:
-            voxel_feats = batch_dict['voxel_features']
-            voxel_coors = batch_dict['voxel_coords'].long()
+        with record_function('DSVT/InputLayer'):
+            if self.pc_type =='Radar':
+                voxel_feats = batch_dict['radar_voxel_features']
+                voxel_coors = batch_dict['radar_voxel_coords'].long()
+            else:
+                voxel_feats = batch_dict['voxel_features']
+                voxel_coors = batch_dict['voxel_coords'].long()
+                
+            voxel_info = {}
+            voxel_info['voxel_feats_stage0'] = voxel_feats.clone()
+            voxel_info['voxel_coors_stage0'] = voxel_coors.clone()
             
-        voxel_info = {}
-        voxel_info['voxel_feats_stage0'] = voxel_feats.clone()
-        voxel_info['voxel_coors_stage0'] = voxel_coors.clone()
-        
-        for stage_id in range(self.stage_num):
-            # window partition of corrsponding stage-map
-            voxel_info = self.window_partition(voxel_info, stage_id)
-            # generate set id of corrsponding stage-map
-            voxel_info = self.get_set(voxel_info, stage_id)
-            for block_id in range(self.set_info[stage_id][1]):
-                for shift_id in range(self.num_shifts[stage_id]):
-                    voxel_info[f'pos_embed_stage{stage_id}_block{block_id}_shift{shift_id}'] = \
-                    self.get_pos_embed(voxel_info[f'coors_in_win_stage{stage_id}_shift{shift_id}'], stage_id, block_id, shift_id)
+            for stage_id in range(self.stage_num):
+                voxel_info = self.window_partition(voxel_info, stage_id)
+                voxel_info = self.get_set(voxel_info, stage_id)
+                for block_id in range(self.set_info[stage_id][1]):
+                    for shift_id in range(self.num_shifts[stage_id]):
+                        voxel_info[f'pos_embed_stage{stage_id}_block{block_id}_shift{shift_id}'] = \
+                        self.get_pos_embed(voxel_info[f'coors_in_win_stage{stage_id}_shift{shift_id}'], stage_id, block_id, shift_id)
+                
+                if stage_id < self.stage_num - 1:
+                    voxel_info = self.subm_pooling(voxel_info, stage_id)
             
-            # compute pooling information
-            if stage_id < self.stage_num - 1:
-                voxel_info = self.subm_pooling(voxel_info, stage_id)
-        
-        return voxel_info
+            return voxel_info
     
     @torch.no_grad()
     def subm_pooling(self, voxel_info, stage_id):
@@ -477,6 +801,38 @@ class DSVTInputLayer(nn.Module):
         voxel_info[f'voxel_coors_stage{stage_id+1}'] = pool_coors
         
         return voxel_info
+
+    def build_packed_set_metadata(self, set_voxel_inds, set_voxel_mask, total_voxel_num):
+        with record_function('DSVT/BuildPackedSetMetadata'):
+            packed_metadata = []
+            for set_id in range(set_voxel_inds.shape[0]):
+                set_voxel_inds_single = set_voxel_inds[set_id]
+                set_voxel_mask_single = set_voxel_mask[set_id]
+                valid_mask = (~set_voxel_mask_single) & (set_voxel_inds_single >= 0)
+                valid_counts = valid_mask.sum(dim=-1, dtype=torch.int32)
+                token_indices = set_voxel_inds_single[valid_mask].contiguous()
+                restore_perm = token_indices.new_full((total_voxel_num,), -1)
+                restore_perm[token_indices] = torch.arange(token_indices.numel(), device=token_indices.device, dtype=token_indices.dtype)
+                cu_seqlens = F.pad(torch.cumsum(valid_counts, dim=0, dtype=torch.int32), (1, 0))
+                max_seqlen = int(valid_counts.max().item()) if valid_counts.numel() > 0 else 0
+                output_complete = bool((restore_perm >= 0).all().item())
+                output_voxel_inds = None
+                if output_complete:
+                    restore_perm = restore_perm.long()
+                else:
+                    output_voxel_inds = torch.nonzero(restore_perm >= 0, as_tuple=False).flatten().long()
+                    restore_perm = restore_perm[output_voxel_inds].long()
+
+                packed_metadata.append({
+                    'token_indices': token_indices,
+                    'cu_seqlens': cu_seqlens,
+                    'max_seqlen': max_seqlen,
+                    'valid_counts': valid_counts,
+                    'restore_perm': restore_perm,
+                    'output_voxel_inds': output_voxel_inds,
+                    'output_complete': output_complete
+                })
+            return packed_metadata
     
     def get_set(self, voxel_info, stage_id):
         '''
@@ -494,98 +850,109 @@ class DSVTInputLayer(nn.Module):
         Returns:
             See from 'forward' function.
         '''
-        batch_win_inds_shift0 = voxel_info[f'batch_win_inds_stage{stage_id}_shift0']
-        coors_in_win_shift0 = voxel_info[f'coors_in_win_stage{stage_id}_shift0']
-        set_voxel_inds_shift0 = self.get_set_single_shift(batch_win_inds_shift0, stage_id, shift_id=0, coors_in_win=coors_in_win_shift0)
-        voxel_info[f'set_voxel_inds_stage{stage_id}_shift0'] = set_voxel_inds_shift0  
-        # compute key masks, voxel duplication must happen continuously
-        prefix_set_voxel_inds_s0 = torch.roll(set_voxel_inds_shift0.clone(), shifts=1, dims=-1)
-        prefix_set_voxel_inds_s0[ :, :, 0] = -1
-        set_voxel_mask_s0 = (set_voxel_inds_shift0 == prefix_set_voxel_inds_s0)
-        voxel_info[f'set_voxel_mask_stage{stage_id}_shift0'] = set_voxel_mask_s0
+        with record_function('DSVT/GetSet'):
+            total_voxel_num = voxel_info[f'voxel_feats_stage{stage_id}'].shape[0]
+            batch_win_inds_shift0 = voxel_info[f'batch_win_inds_stage{stage_id}_shift0']
+            coors_in_win_shift0 = voxel_info[f'coors_in_win_stage{stage_id}_shift0']
+            set_voxel_inds_shift0 = self.get_set_single_shift(batch_win_inds_shift0, stage_id, shift_id=0, coors_in_win=coors_in_win_shift0)
+            voxel_info[f'set_voxel_inds_stage{stage_id}_shift0'] = set_voxel_inds_shift0  
+            prefix_set_voxel_inds_s0 = torch.roll(set_voxel_inds_shift0.clone(), shifts=1, dims=-1)
+            prefix_set_voxel_inds_s0[ :, :, 0] = -1
+            set_voxel_mask_s0 = (set_voxel_inds_shift0 == prefix_set_voxel_inds_s0)
+            voxel_info[f'set_voxel_mask_stage{stage_id}_shift0'] = set_voxel_mask_s0
+            if self.enable_packed_flash_attn:
+                voxel_info[f'set_voxel_packed_stage{stage_id}_shift0'] = self.build_packed_set_metadata(
+                    set_voxel_inds_shift0, set_voxel_mask_s0, total_voxel_num
+                )
 
-        batch_win_inds_shift1 = voxel_info[f'batch_win_inds_stage{stage_id}_shift1']
-        coors_in_win_shift1 = voxel_info[f'coors_in_win_stage{stage_id}_shift1']
-        set_voxel_inds_shift1 = self.get_set_single_shift(batch_win_inds_shift1, stage_id, shift_id=1, coors_in_win=coors_in_win_shift1)
-        voxel_info[f'set_voxel_inds_stage{stage_id}_shift1'] = set_voxel_inds_shift1  
-        # compute key masks, voxel duplication must happen continuously
-        prefix_set_voxel_inds_s1 = torch.roll(set_voxel_inds_shift1.clone(), shifts=1, dims=-1)
-        prefix_set_voxel_inds_s1[ :, :, 0] = -1
-        set_voxel_mask_s1 = (set_voxel_inds_shift1 == prefix_set_voxel_inds_s1)
-        voxel_info[f'set_voxel_mask_stage{stage_id}_shift1'] = set_voxel_mask_s1
+            batch_win_inds_shift1 = voxel_info[f'batch_win_inds_stage{stage_id}_shift1']
+            coors_in_win_shift1 = voxel_info[f'coors_in_win_stage{stage_id}_shift1']
+            set_voxel_inds_shift1 = self.get_set_single_shift(batch_win_inds_shift1, stage_id, shift_id=1, coors_in_win=coors_in_win_shift1)
+            voxel_info[f'set_voxel_inds_stage{stage_id}_shift1'] = set_voxel_inds_shift1  
+            prefix_set_voxel_inds_s1 = torch.roll(set_voxel_inds_shift1.clone(), shifts=1, dims=-1)
+            prefix_set_voxel_inds_s1[ :, :, 0] = -1
+            set_voxel_mask_s1 = (set_voxel_inds_shift1 == prefix_set_voxel_inds_s1)
+            voxel_info[f'set_voxel_mask_stage{stage_id}_shift1'] = set_voxel_mask_s1
+            if self.enable_packed_flash_attn:
+                voxel_info[f'set_voxel_packed_stage{stage_id}_shift1'] = self.build_packed_set_metadata(
+                    set_voxel_inds_shift1, set_voxel_mask_s1, total_voxel_num
+                )
 
-        return voxel_info
+            return voxel_info
     
     def get_set_single_shift(self, batch_win_inds, stage_id, shift_id=None, coors_in_win=None):
-        device = batch_win_inds.device
-        # the number of voxels assigned to a set
-        voxel_num_set = self.set_info[stage_id][0]
-        # max number of voxels in a window
-        max_voxel = self.window_shape[stage_id][shift_id][0] * self.window_shape[stage_id][shift_id][1] * self.window_shape[stage_id][shift_id][2]
-        # get unique set indexs
-        contiguous_win_inds = torch.unique(batch_win_inds, return_inverse=True)[1]
-        voxelnum_per_win = torch.bincount(contiguous_win_inds)
-        win_num = voxelnum_per_win.shape[0]
-        setnum_per_win_float = voxelnum_per_win / voxel_num_set
-        setnum_per_win = torch.ceil(setnum_per_win_float).long()
-        set_win_inds, set_inds_in_win = get_continous_inds(setnum_per_win)
-        
-        # compution of Eq.3 in 'DSVT: Dynamic Sparse Voxel Transformer with Rotated Sets' - https://arxiv.org/abs/2301.06051, 
-        # for each window, we can get voxel indexs belong to different sets.
-        offset_idx = set_inds_in_win[:,None].repeat(1, voxel_num_set) * voxel_num_set
-        base_idx = torch.arange(0, voxel_num_set, 1, device=device)
-        base_select_idx = offset_idx + base_idx
-        base_select_idx = base_select_idx * voxelnum_per_win[set_win_inds][:,None]
-        base_select_idx = base_select_idx.double() / (setnum_per_win[set_win_inds] * voxel_num_set)[:,None].double()
-        base_select_idx = torch.floor(base_select_idx)
-        # obtain unique indexs in whole space
-        select_idx = base_select_idx
-        select_idx = select_idx + set_win_inds.view(-1, 1) * max_voxel
-           
-        # this function will return unordered inner window indexs of each voxel
-        inner_voxel_inds = get_inner_win_inds_cuda(contiguous_win_inds)
-        global_voxel_inds = contiguous_win_inds * max_voxel + inner_voxel_inds
-        _, order1 = torch.sort(global_voxel_inds)
+        with record_function('DSVT/GetSetSingleShift'):
+            device = batch_win_inds.device
+            voxel_num_set = self.set_info[stage_id][0]
+            max_voxel = self.window_shape[stage_id][shift_id][0] * self.window_shape[stage_id][shift_id][1] * self.window_shape[stage_id][shift_id][2]
+            contiguous_win_inds = torch.unique(batch_win_inds, return_inverse=True)[1]
+            voxelnum_per_win = torch.bincount(contiguous_win_inds)
+            win_num = voxelnum_per_win.shape[0]
+            setnum_per_win = torch.div(voxelnum_per_win + voxel_num_set - 1, voxel_num_set, rounding_mode='floor')
+            set_win_inds, set_inds_in_win = get_continous_inds(setnum_per_win)
+            
+            base_idx = torch.arange(0, voxel_num_set, 1, device=device)
+            base_select_idx = set_inds_in_win[:, None] * voxel_num_set + base_idx
+            base_select_idx = base_select_idx * voxelnum_per_win[set_win_inds][:, None]
+            base_select_idx = torch.div(
+                base_select_idx,
+                (setnum_per_win[set_win_inds] * voxel_num_set)[:, None],
+                rounding_mode='floor'
+            )
+            select_idx = base_select_idx + set_win_inds.view(-1, 1) * max_voxel
+            if self.use_fused_get_set and batch_win_inds.is_cuda:
+                with record_function('DSVT/GetSetSingleShiftFused'):
+                    return fused_get_set_single_shift(
+                        contiguous_win_inds,
+                        coors_in_win,
+                        select_idx.long(),
+                        int(win_num),
+                        self.window_shape[stage_id][shift_id]
+                    )
+               
+            inner_voxel_inds = get_inner_win_inds_cuda(contiguous_win_inds)
+            window_offsets = contiguous_win_inds * max_voxel
+            global_voxel_inds = window_offsets + inner_voxel_inds
+            _, order1 = torch.sort(global_voxel_inds)
+            voxel_arange = torch.arange(inner_voxel_inds.shape[0], dtype=torch.long, device=device)
+            sorted_inner = torch.empty_like(inner_voxel_inds)
+            padding_buffer = torch.empty((win_num * max_voxel), dtype=torch.long, device=device)
 
-        # get y-axis partition results
-        global_voxel_inds_sorty = contiguous_win_inds * max_voxel + \
-                coors_in_win[:,1] * self.window_shape[stage_id][shift_id][0] * self.window_shape[stage_id][shift_id][2] + \
-                coors_in_win[:,2] * self.window_shape[stage_id][shift_id][2] + \
-                coors_in_win[:,0]
-        _, order2 = torch.sort(global_voxel_inds_sorty)
-        inner_voxel_inds_sorty = -torch.ones_like(inner_voxel_inds)
-        inner_voxel_inds_sorty.scatter_(dim=0, index=order2, src=inner_voxel_inds[order1]) # get y-axis ordered inner window indexs of each voxel
-        voxel_inds_in_batch_sorty = inner_voxel_inds_sorty + max_voxel * contiguous_win_inds
-        voxel_inds_padding_sorty = -1 * torch.ones((win_num * max_voxel), dtype=torch.long, device=device)
-        voxel_inds_padding_sorty[voxel_inds_in_batch_sorty] = torch.arange(0, voxel_inds_in_batch_sorty.shape[0], dtype=torch.long, device=device)
-        set_voxel_inds_sorty = voxel_inds_padding_sorty[select_idx.long()]
+            def build_axis_set_voxel_inds(axis_major_inds):
+                _, order2 = torch.sort(axis_major_inds)
+                sorted_inner.fill_(-1)
+                sorted_inner.scatter_(dim=0, index=order2, src=inner_voxel_inds[order1])
+                voxel_inds_in_batch = sorted_inner + window_offsets
+                padding_buffer.fill_(-1)
+                padding_buffer[voxel_inds_in_batch] = voxel_arange
+                return padding_buffer[select_idx]
 
-        # get x-axis partition results
-        global_voxel_inds_sortx = contiguous_win_inds * max_voxel + \
-                coors_in_win[:,2] * self.window_shape[stage_id][shift_id][1] * self.window_shape[stage_id][shift_id][2] + \
-                coors_in_win[:,1] * self.window_shape[stage_id][shift_id][2] + \
-                coors_in_win[:,0]
-        _, order2 = torch.sort(global_voxel_inds_sortx)
-        inner_voxel_inds_sortx = -torch.ones_like(inner_voxel_inds)
-        inner_voxel_inds_sortx.scatter_(dim=0,index=order2, src=inner_voxel_inds[order1]) # get x-axis ordered inner window indexs of each voxel
-        voxel_inds_in_batch_sortx = inner_voxel_inds_sortx + max_voxel * contiguous_win_inds
-        voxel_inds_padding_sortx = -1 * torch.ones((win_num * max_voxel), dtype=torch.long, device=device)
-        voxel_inds_padding_sortx[voxel_inds_in_batch_sortx] = torch.arange(0, voxel_inds_in_batch_sortx.shape[0], dtype=torch.long, device=device)
-        set_voxel_inds_sortx = voxel_inds_padding_sortx[select_idx.long()]
+            global_voxel_inds_sorty = window_offsets + \
+                    coors_in_win[:,1] * self.window_shape[stage_id][shift_id][0] * self.window_shape[stage_id][shift_id][2] + \
+                    coors_in_win[:,2] * self.window_shape[stage_id][shift_id][2] + \
+                    coors_in_win[:,0]
+            set_voxel_inds_sorty = build_axis_set_voxel_inds(global_voxel_inds_sorty)
 
-        all_set_voxel_inds = torch.stack((set_voxel_inds_sorty, set_voxel_inds_sortx), dim=0)
-        return all_set_voxel_inds
+            global_voxel_inds_sortx = window_offsets + \
+                    coors_in_win[:,2] * self.window_shape[stage_id][shift_id][1] * self.window_shape[stage_id][shift_id][2] + \
+                    coors_in_win[:,1] * self.window_shape[stage_id][shift_id][2] + \
+                    coors_in_win[:,0]
+            set_voxel_inds_sortx = build_axis_set_voxel_inds(global_voxel_inds_sortx)
+
+            all_set_voxel_inds = torch.stack((set_voxel_inds_sorty, set_voxel_inds_sortx), dim=0)
+            return all_set_voxel_inds
 
     @torch.no_grad()
     def window_partition(self, voxel_info, stage_id):
-        for i in range(2):
-            batch_win_inds, coors_in_win = get_window_coors(voxel_info[f'voxel_coors_stage{stage_id}'], 
-                                                        self.sparse_shape_list[stage_id], self.window_shape[stage_id][i], i == 1, self.shift_list[stage_id][i])
-                                            
-            voxel_info[f'batch_win_inds_stage{stage_id}_shift{i}'] = batch_win_inds
-            voxel_info[f'coors_in_win_stage{stage_id}_shift{i}'] = coors_in_win
-        
-        return voxel_info
+        with record_function('DSVT/WindowPartition'):
+            for i in range(2):
+                batch_win_inds, coors_in_win = get_window_coors(voxel_info[f'voxel_coors_stage{stage_id}'], 
+                                                            self.sparse_shape_list[stage_id], self.window_shape[stage_id][i], i == 1, self.shift_list[stage_id][i])
+                                                
+                voxel_info[f'batch_win_inds_stage{stage_id}_shift{i}'] = batch_win_inds
+                voxel_info[f'coors_in_win_stage{stage_id}_shift{i}'] = coors_in_win
+            
+            return voxel_info
 
     def get_pos_embed(self, coors_in_win, stage_id, block_id, shift_id):
         '''
@@ -630,7 +997,11 @@ class DSVT_Radar(DSVT):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         
-        self.input_layer = DSVTInputLayer_Radar(model_cfg=self.model_cfg.INPUT_LAYER)
+        self.input_layer = DSVTInputLayer_Radar(
+            model_cfg=self.model_cfg.INPUT_LAYER,
+            pc_type='Radar',
+            attn_backend=self.attn_backend
+        )
        
     def forward(self, batch_dict):
         voxel_info = self.input_layer(batch_dict)
@@ -638,6 +1009,12 @@ class DSVT_Radar(DSVT):
         voxel_feat = voxel_info['voxel_feats_stage0']
         set_voxel_inds_list = [[voxel_info[f'set_voxel_inds_stage{s}_shift{i}'] for i in range(self.num_shifts[s])] for s in range(self.stage_num)]
         set_voxel_masks_list = [[voxel_info[f'set_voxel_mask_stage{s}_shift{i}'] for i in range(self.num_shifts[s])] for s in range(self.stage_num)]
+        set_voxel_packed_list = None
+        if self.attn_backend == 'flash_attn':
+            set_voxel_packed_list = [
+                [voxel_info[f'set_voxel_packed_stage{s}_shift{i}'] for i in range(self.num_shifts[s])]
+                for s in range(self.stage_num)
+            ]
         pos_embed_list = [[[voxel_info[f'pos_embed_stage{s}_block{b}_shift{i}'] for i in range(self.num_shifts[s])] for b in range(self.set_info[s][1])] for s in range(self.stage_num)]
         pooling_mapping_index = [voxel_info[f'pooling_mapping_index_stage{s+1}'] for s in range(self.stage_num-1)]
         pooling_index_in_pool = [voxel_info[f'pooling_index_in_pool_stage{s+1}'] for s in range(self.stage_num-1)]
@@ -652,10 +1029,24 @@ class DSVT_Radar(DSVT):
                 block = block_layers[i]
                 residual = output.clone()
                 if self.use_torch_ckpt==False:
-                    output = block(output, set_voxel_inds_list[stage_id], set_voxel_masks_list[stage_id], pos_embed_list[stage_id][i], \
-                                block_id=block_id)
+                    output = block(
+                        output,
+                        set_voxel_inds_list[stage_id],
+                        set_voxel_masks_list[stage_id],
+                        None if set_voxel_packed_list is None else set_voxel_packed_list[stage_id],
+                        pos_embed_list[stage_id][i],
+                        block_id=block_id
+                    )
                 else:
-                    output = checkpoint(block, output, set_voxel_inds_list[stage_id], set_voxel_masks_list[stage_id], pos_embed_list[stage_id][i], block_id)
+                    output = checkpoint(
+                        block,
+                        output,
+                        set_voxel_inds_list[stage_id],
+                        set_voxel_masks_list[stage_id],
+                        None if set_voxel_packed_list is None else set_voxel_packed_list[stage_id],
+                        pos_embed_list[stage_id][i],
+                        block_id
+                    )
                 output = residual_norm_layers[i](output + residual)
                 block_id += 1
             if stage_id < self.stage_num - 1:
@@ -673,7 +1064,7 @@ class DSVT_Radar(DSVT):
                     output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features).squeeze(-1)
                 elif self.reduction_type == 'attention':
                     prepool_features = prepool_features.view(pooled_voxel_num, pool_volume, -1).permute(0, 2, 1)
-                    key_padding_mask = torch.zeros((pooled_voxel_num, pool_volume)).to(prepool_features.device).int()
+                    key_padding_mask = torch.zeros((pooled_voxel_num, pool_volume), device=prepool_features.device, dtype=torch.bool)
                     output = self.__getattr__(f'stage_{stage_id}_reduction')(prepool_features, key_padding_mask)
                 else:
                     raise NotImplementedError

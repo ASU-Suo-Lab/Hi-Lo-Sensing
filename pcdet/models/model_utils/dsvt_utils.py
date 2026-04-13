@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 from pcdet.ops.ingroup_inds.ingroup_inds_op import ingroup_inds
+try:
+    from pcdet.ops.dsvt_set_ops import fused_get_set_single_shift
+except ImportError:
+    fused_get_set_single_shift = None
 
 
 get_inner_win_inds_cuda = ingroup_inds

@@ -70,6 +70,8 @@ MODEL:
 
     BACKBONE_3D:
         NAME: DSVT
+        ATTN_BACKEND: sdpa
+        ATTN_FORCE_FLASH: False
         INPUT_LAYER:
             sparse_shape: [468, 468, 32]
             downsample_stride: [[1, 1, 4], [1, 1, 4], [1, 1, 2]]
@@ -167,6 +169,8 @@ MODEL:
 OPTIMIZATION:
     BATCH_SIZE_PER_GPU: 3
     NUM_EPOCHS: 24
+    USE_AMP: True
+    AMP_DTYPE: bf16
 
     OPTIMIZER: adam_onecycle
     LR: 0.003

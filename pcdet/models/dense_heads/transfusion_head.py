@@ -321,13 +321,13 @@ class TransFusionHead(nn.Module):
     def get_targets_single(self, gt_bboxes_3d, gt_labels_3d, preds_dict):
         
         num_proposals = preds_dict["center"].shape[-1]
-        score = copy.deepcopy(preds_dict["heatmap"].detach())
-        center = copy.deepcopy(preds_dict["center"].detach())
-        height = copy.deepcopy(preds_dict["height"].detach())
-        dim = copy.deepcopy(preds_dict["dim"].detach())
-        rot = copy.deepcopy(preds_dict["rot"].detach())
+        score = torch.nan_to_num(copy.deepcopy(preds_dict["heatmap"].detach()), nan=0.0, posinf=1.0, neginf=0.0)
+        center = torch.nan_to_num(copy.deepcopy(preds_dict["center"].detach()), nan=0.0, posinf=1e4, neginf=-1e4)
+        height = torch.nan_to_num(copy.deepcopy(preds_dict["height"].detach()), nan=0.0, posinf=1e4, neginf=-1e4)
+        dim = torch.nan_to_num(copy.deepcopy(preds_dict["dim"].detach()), nan=0.0, posinf=10.0, neginf=-10.0)
+        rot = torch.nan_to_num(copy.deepcopy(preds_dict["rot"].detach()), nan=0.0, posinf=1.0, neginf=-1.0)
         if "vel" in preds_dict.keys():
-            vel = copy.deepcopy(preds_dict["vel"].detach())
+            vel = torch.nan_to_num(copy.deepcopy(preds_dict["vel"].detach()), nan=0.0, posinf=1e4, neginf=-1e4)
         else:
             vel = None
 
@@ -492,6 +492,13 @@ class TransFusionHead(nn.Module):
         score_thresh = post_process_cfg.SCORE_THRESH
         post_center_range = post_process_cfg.POST_CENTER_RANGE
         post_center_range = torch.tensor(post_center_range).cuda().float()
+        heatmap = torch.nan_to_num(heatmap, nan=0.0, posinf=1.0, neginf=0.0)
+        center = torch.nan_to_num(center, nan=0.0, posinf=1e4, neginf=-1e4)
+        height = torch.nan_to_num(height, nan=0.0, posinf=1e4, neginf=-1e4)
+        dim = torch.nan_to_num(dim, nan=0.0, posinf=10.0, neginf=-10.0)
+        rot = torch.nan_to_num(rot, nan=0.0, posinf=1.0, neginf=-1.0)
+        if vel is not None:
+            vel = torch.nan_to_num(vel, nan=0.0, posinf=1e4, neginf=-1e4)
         # class label
         final_preds = heatmap.max(1, keepdims=False).indices
         final_scores = heatmap.max(1, keepdims=False).values
@@ -515,7 +522,10 @@ class TransFusionHead(nn.Module):
             predictions_dict = {
                 'pred_boxes': boxes3d,
                 'pred_scores': scores,
-                'pred_labels': labels
+                'pred_labels': labels,
+                'debug_raw_box_count': int(scores.shape[0]),
+                'debug_raw_score_max': float(scores.max().item()) if scores.numel() > 0 else 0.0,
+                'debug_raw_score_mean': float(scores.mean().item()) if scores.numel() > 0 else 0.0,
             }
             predictions_dicts.append(predictions_dict)
 
@@ -539,6 +549,12 @@ class TransFusionHead(nn.Module):
                 'pred_scores': scores,
                 'pred_labels': labels,
                 'cmask':cmask,
+                'debug_raw_box_count': int(final_scores[i].shape[0]),
+                'debug_raw_score_max': float(final_scores[i].max().item()) if final_scores[i].numel() > 0 else 0.0,
+                'debug_raw_score_mean': float(final_scores[i].mean().item()) if final_scores[i].numel() > 0 else 0.0,
+                'debug_post_center_count': int(mask[i].sum().item()),
+                'debug_post_thresh_count': int(thresh_mask[i].sum().item()),
+                'debug_post_filter_count': int(cmask.sum().item()),
             }
 
             predictions_dicts.append(predictions_dict)
@@ -616,7 +632,21 @@ class TransFusionHead(nn.Module):
                     keep_indices = torch.where(task_mask != 0)[0][task_keep_indices]
                     keep_mask[keep_indices] = 1
             keep_mask = keep_mask.bool()
-            ret = dict(pred_boxes=boxes3d[keep_mask], pred_scores=scores[keep_mask], pred_labels=labels[keep_mask])
+            final_scores_keep = scores[keep_mask]
+            ret = dict(
+                pred_boxes=boxes3d[keep_mask],
+                pred_scores=final_scores_keep,
+                pred_labels=labels[keep_mask],
+                debug_raw_box_count=ret_dict[i].get('debug_raw_box_count', int(scores.shape[0])),
+                debug_raw_score_max=ret_dict[i].get('debug_raw_score_max', float(scores.max().item()) if scores.numel() > 0 else 0.0),
+                debug_raw_score_mean=ret_dict[i].get('debug_raw_score_mean', float(scores.mean().item()) if scores.numel() > 0 else 0.0),
+                debug_post_center_count=ret_dict[i].get('debug_post_center_count', int(scores.shape[0])),
+                debug_post_thresh_count=ret_dict[i].get('debug_post_thresh_count', int(scores.shape[0])),
+                debug_post_filter_count=ret_dict[i].get('debug_post_filter_count', int(scores.shape[0])),
+                debug_post_nms_count=int(keep_mask.sum().item()),
+                debug_post_nms_score_max=float(final_scores_keep.max().item()) if final_scores_keep.numel() > 0 else 0.0,
+                debug_post_nms_score_mean=float(final_scores_keep.mean().item()) if final_scores_keep.numel() > 0 else 0.0,
+            )
             new_ret_dict.append(ret)
 
         for k in range(batch_size):

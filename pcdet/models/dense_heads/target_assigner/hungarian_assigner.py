@@ -104,13 +104,17 @@ class HungarianAssigner3D:
             return num_gts, assigned_gt_inds, max_overlaps, assigned_labels
 
         # 2. compute the weighted costs
+        bboxes = torch.nan_to_num(bboxes, nan=0.0, posinf=1e4, neginf=-1e4)
+        gt_bboxes = torch.nan_to_num(gt_bboxes, nan=0.0, posinf=1e4, neginf=-1e4)
+        cls_pred = torch.nan_to_num(cls_pred, nan=0.0, posinf=1.0, neginf=0.0)
+
         cls_cost = self.focal_loss_cost(cls_pred[0].T, gt_labels)
         reg_cost = self.bevbox_cost(bboxes, gt_bboxes, point_cloud_range)
         iou_cost, iou = self.iou3d_cost(bboxes, gt_bboxes)
         
 
         # weighted sum of above three costs
-        cost = cls_cost + reg_cost + iou_cost
+        cost = torch.nan_to_num(cls_cost + reg_cost + iou_cost, nan=1e8, posinf=1e8, neginf=-1e8)
 
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()

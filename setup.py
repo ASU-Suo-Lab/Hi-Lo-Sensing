@@ -134,6 +134,22 @@ if __name__ == '__main__':
                 ]
             ),
             make_cuda_ext(
+                name='dsvt_set_ops_cuda',
+                module='pcdet.ops.dsvt_set_ops',
+                sources=[
+                    'src/dsvt_set_ops.cpp',
+                    'src/dsvt_set_ops_kernel.cu',
+                ]
+            ),
+            make_cuda_ext(
+                name='lion_map_ops_cuda',
+                module='pcdet.ops.lion_map_ops',
+                sources=[
+                    'src/lion_map_ops.cpp',
+                    'src/lion_map_ops_kernel.cu',
+                ]
+            ),
+            make_cuda_ext(
                 name='ms_deform_attn_cuda',
                 module='pcdet.ops.ms_deform_attn',
                 sources=[

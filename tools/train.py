@@ -49,6 +49,7 @@ def parse_config():
     parser.add_argument('--ckpt_save_time_interval', type=int, default=2400, help='in terms of seconds')
     parser.add_argument('--wo_gpu_stat', action='store_true',default=True, help='')
     parser.add_argument('--use_amp', action='store_true', help='use mix precision training')
+    parser.add_argument('--amp_dtype', choices=['fp16', 'bf16'], default=None, help='mixed precision dtype')
     
 
     args = parser.parse_args()
@@ -56,17 +57,26 @@ def parse_config():
     cfg_from_yaml_file(args.cfg_file, cfg)
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])  # remove 'cfgs' and 'xxxx.yaml'
-    
-    args.use_amp = args.use_amp or cfg.OPTIMIZATION.get('USE_AMP', False)
 
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
+
+    args.use_amp = args.use_amp or cfg.OPTIMIZATION.get('USE_AMP', False)
+    args.amp_dtype = args.amp_dtype or cfg.OPTIMIZATION.get('AMP_DTYPE', 'fp16')
 
     return args, cfg
 
 
 def main():
     args, cfg = parse_config()
+    is_lion_backbone = cfg.MODEL.get('BACKBONE_3D', {}).get('NAME', None) == 'LION3DBackboneOneStride'
+    fla_cfg = cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('FLA_CFG', {})
+    if (
+        cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('NAME', None) == 'FLA_GLA'
+        and fla_cfg.get('disable_global_amp_train', False)
+    ):
+        args.use_amp = False
+
     if args.launcher == 'none':
         dist_train = False
         total_gpus = 1
@@ -110,6 +120,11 @@ def main():
         
     for key, val in vars(args).items():
         logger.info('{:16} {}'.format(key, val))
+    if (
+        cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('NAME', None) == 'FLA_GLA'
+        and fla_cfg.get('disable_global_amp_train', False)
+    ):
+        logger.info('FLA_GLA training stability mode: disable global AMP and keep operator-level fp32 fallback enabled.')
     log_config_to_file(cfg, logger=logger)
     if cfg.LOCAL_RANK == 0:
         os.system('cp %s %s' % (args.cfg_file, output_dir))
@@ -199,6 +214,7 @@ def main():
         use_logger_to_record=not args.use_tqdm_to_record, 
         show_gpu_stat=not args.wo_gpu_stat,
         use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
         cfg=cfg
     )
 
@@ -207,6 +223,9 @@ def main():
 
     logger.info('**********************End training %s/%s(%s)**********************\n\n\n'
                 % (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
+
+    if dist_train and torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     logger.info('**********************Start evaluation %s/%s(%s)**********************' %
                 (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
@@ -219,6 +238,15 @@ def main():
     eval_output_dir = output_dir / 'eval' / 'eval_with_train'
     eval_output_dir.mkdir(parents=True, exist_ok=True)
     args.start_epoch = max(args.epochs - args.num_epochs_to_eval, 0)  # Only evaluate the last args.num_epochs_to_eval epochs
+    if is_lion_backbone:
+        args.use_amp = False
+        logger.info('LION evaluation stability mode: disable global AMP because current spconv ops do not support bf16.')
+    elif (
+        cfg.MODEL.get('BACKBONE_3D', {}).get('OPERATOR', {}).get('NAME', None) == 'FLA_GLA'
+        and fla_cfg.get('disable_global_amp_eval', False)
+    ):
+        args.use_amp = False
+        logger.info('FLA_GLA evaluation stability mode: disable global AMP to avoid unsupported bf16 spconv ops.')
 
     repeat_eval_ckpt(
         model.module if dist_train else model,

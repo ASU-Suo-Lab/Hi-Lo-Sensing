@@ -4,7 +4,10 @@ import pickle
 import random
 import shutil
 import subprocess
-import SharedArray
+try:
+    import SharedArray
+except ImportError:
+    SharedArray = None
 
 import numpy as np
 import torch
@@ -219,8 +222,9 @@ def init_dist_pytorch(tcp_port, local_rank, backend='nccl'):
         # rank=local_rank,
         # world_size=num_gpus
     )
+    world_size = dist.get_world_size()
     rank = dist.get_rank()
-    return num_gpus, rank
+    return world_size, rank
 
 
 def get_dist_info(return_gpu_per_machine=False):
@@ -290,6 +294,8 @@ def generate_voxel2pinds(sparse_tensor):
 
 
 def sa_create(name, var):
+    if SharedArray is None:
+        raise ImportError('SharedArray is required when shared memory is enabled')
     x = SharedArray.create(name, var.shape, dtype=var.dtype)
     x[...] = var[...]
     x.flags.writeable = False

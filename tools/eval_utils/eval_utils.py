@@ -1,12 +1,18 @@
 import pickle
 import time
 
-import numpy as np
 import torch
 import tqdm
 
 from pcdet.models import load_data_to_gpu
 from pcdet.utils import common_utils
+
+
+def _get_eval_amp_settings(cfg, args):
+    use_amp = getattr(args, 'use_amp', cfg.OPTIMIZATION.get('USE_AMP', False))
+    amp_dtype = getattr(args, 'amp_dtype', cfg.OPTIMIZATION.get('AMP_DTYPE', 'fp16'))
+    autocast_dtype = torch.float16 if amp_dtype == 'fp16' else torch.bfloat16
+    return use_amp, autocast_dtype
 
 
 def statistics_info(cfg, ret_dict, metric, disp_dict):
@@ -33,13 +39,15 @@ def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=Fal
         metric['recall_roi_%s' % str(cur_thresh)] = 0
         metric['recall_rcnn_%s' % str(cur_thresh)] = 0
 
+    module_time_sums_ms = {}
+    module_mem_sums_mb = {}
+    profile_sample_count = 0
+    pred_debug_sums = {}
+    pred_debug_count = 0
+
     dataset = dataloader.dataset
     class_names = dataset.class_names
     det_annos = []
-
-    if getattr(args, 'infer_time', False):
-        start_iter = int(len(dataloader) * 0.1)
-        infer_time_meter = common_utils.AverageMeter()
 
     logger.info('*************** EPOCH %s EVALUATION *****************' % epoch_id)
     if dist_test:
@@ -51,28 +59,53 @@ def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=Fal
                 broadcast_buffers=False
         )
     model.eval()
+    use_amp, autocast_dtype = _get_eval_amp_settings(cfg, args)
 
     if cfg.LOCAL_RANK == 0:
         progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc='eval', dynamic_ncols=True)
-    start_time = time.time()
+    eval_start_time = time.time()
     for i, batch_dict in enumerate(dataloader):
         load_data_to_gpu(batch_dict)
-
         if getattr(args, 'infer_time', False):
-            start_time = time.time()
+            batch_dict['_enable_module_profile'] = True
 
         with torch.no_grad():
-            pred_dicts, ret_dict = model(batch_dict)
+            with torch.amp.autocast('cuda', enabled=use_amp, dtype=autocast_dtype):
+                pred_dicts, ret_dict = model(batch_dict)
+
+        debug_keys = [
+            'debug_raw_box_count',
+            'debug_raw_score_max',
+            'debug_raw_score_mean',
+            'debug_post_center_count',
+            'debug_post_thresh_count',
+            'debug_post_filter_count',
+            'debug_post_nms_count',
+            'debug_post_nms_score_max',
+            'debug_post_nms_score_mean',
+        ]
+        for pred_dict in pred_dicts:
+            if any(key in pred_dict for key in debug_keys):
+                pred_debug_count += 1
+                for key in debug_keys:
+                    if key in pred_dict:
+                        pred_debug_sums[key] = pred_debug_sums.get(key, 0.0) + float(pred_dict[key])
 
         disp_dict = {}
+        statistics_info(cfg, ret_dict, metric, disp_dict)
 
         if getattr(args, 'infer_time', False):
-            inference_time = time.time() - start_time
-            infer_time_meter.update(inference_time * 1000)
-            # use ms to measure inference time
-            disp_dict['infer_time'] = f'{infer_time_meter.val:.2f}({infer_time_meter.avg:.2f})'
+            profile_time_ms = batch_dict.get('_profile_time_ms', ret_dict.get('_profile_time_ms'))
+            profile_mem_mb = batch_dict.get('_profile_mem_mb', ret_dict.get('_profile_mem_mb'))
+            profile_batch_size = batch_dict.get('_profile_batch_size', ret_dict.get('_profile_batch_size', batch_dict['batch_size']))
 
-        statistics_info(cfg, ret_dict, metric, disp_dict)
+            if profile_time_ms is not None and profile_mem_mb is not None:
+                profile_sample_count += int(profile_batch_size)
+                for module_name, module_time_ms in profile_time_ms.items():
+                    module_time_sums_ms[module_name] = module_time_sums_ms.get(module_name, 0.0) + module_time_ms
+                for module_name, module_mem_mb in profile_mem_mb.items():
+                    module_mem_sums_mb[module_name] = module_mem_sums_mb.get(module_name, 0.0) + module_mem_mb
+
         annos = dataset.generate_prediction_dicts(
             batch_dict, pred_dicts, class_names,
             output_path=final_output_dir if args.save_to_file else None
@@ -91,11 +124,28 @@ def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=Fal
         metric = common_utils.merge_results_dist([metric], world_size, tmpdir=result_dir / 'tmpdir')
 
     logger.info('*************** Performance of EPOCH %s *****************' % epoch_id)
-    sec_per_example = (time.time() - start_time) / len(dataloader.dataset)
+    sec_per_example = (time.time() - eval_start_time) / len(dataloader.dataset)
     logger.info('Generate label finished(sec_per_example: %.4f second).' % sec_per_example)
 
     if cfg.LOCAL_RANK != 0:
         return {}
+
+    if getattr(args, 'infer_time', False):
+        if profile_sample_count > 0:
+            logger.info('Average module profiling per sample:')
+            for module_name, total_time_ms in module_time_sums_ms.items():
+                avg_time_ms = total_time_ms / profile_sample_count
+                avg_mem_mb = module_mem_sums_mb.get(module_name, 0.0) / profile_sample_count
+                logger.info('%s: avg_time=%.4f ms, avg_peak_mem=%.4f MiB' % (
+                    module_name, avg_time_ms, avg_mem_mb
+                ))
+        else:
+            logger.info('Module profiling was enabled, but no profiling data was collected.')
+
+    if pred_debug_count > 0:
+        logger.info('Average prediction debug stats per sample:')
+        for key, total_val in pred_debug_sums.items():
+            logger.info('%s: %.6f' % (key, total_val / pred_debug_count))
 
     ret_dict = {}
     if dist_test:

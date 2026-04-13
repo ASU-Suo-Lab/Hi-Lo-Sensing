@@ -333,13 +333,13 @@ class Block(nn.Module):
 
     def forward(self, x):
         if self.post_norm:
-            if self.with_cp:
+            if self.with_cp and self.training:
                 x_out = cp.checkpoint(self.mamba, x)
                 x = x + self.drop_path(self.norm(x_out))
             else:
                 x = x + self.drop_path(self.norm(self.mamba(x)))
         else:
-            if self.with_cp:
+            if self.with_cp and self.training:
                 x = self.norm(x)
                 x_out = cp.checkpoint(self.mamba, x)
                 x = x + self.drop_path(x_out)
