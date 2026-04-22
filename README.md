@@ -3,24 +3,31 @@
 
 This repo is the official implementation of our paper: On the Resolution–Performance Tradeoff in LiDAR and 4D Radar Fusion for Roadside Perception as well as the follow-ups. Our code is built upon the codebase of [OpenPCDet](https://github.com/open-mmlab/OpenPCDet).
 
-<p align="center">
-  <img src="assets/mid_fusion_det.png" height="450" alt="DRIFT-M" />
-  <img src="assets/high_only_det.png" height="450" alt="High-resolution LiDAR" />
-</p>
+<table align="center">
+  <tr>
+    <td align="center" valign="top">
+      <img src="assets/mid_fusion_det.png" width="420" alt="DRIFT-M" /><br/>
+      <em>(a) Mid-resolution LiDAR + 4D radar</em>
+    </td>
+    <td align="center" valign="top">
+      <img src="assets/high_only_det.png" width="420" alt="High-resolution LiDAR" /><br/>
+      <em>(b) High-resolution LiDAR</em>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="top">
+      <img src="assets/mAP_FPS.png" width="420" alt="Accuracy-speed trade-off" /><br/>
+      <em>(c) Accuracy-speed trade-off</em>
+    </td>
+    <td align="center" valign="top">
+      <img src="assets/mAP_cost.png" width="420" alt="Performance-cost trade-off" /><br/>
+      <em>(d) Performance-cost trade-off</em>
+    </td>
+  </tr>
+</table>
 
 <p align="center">
-  <img src="assets/mAP_FPS.png" height="400"  alt="Accuracy-speed trade-off" />
-  <img src="assets/mAP_cost.png" height="400" alt="Performance-cost trade-off" />
-</p>
-
-<p align="center">
-  <em>
-    Resolution-aware LiDAR-4D radar fusion for efficient roadside perception.
-    (a) Qualitative results of the proposed DRIFT-M model.
-    (b) Comparison with a high-resolution LiDAR-only baseline.
-    (c) Accuracy-speed trade-off.
-    (d) Performance-cost trade-off.
-  </em>
+  <em>Resolution-aware LiDAR-4D radar fusion for efficient roadside perception.</em>
 </p>
 
 
@@ -31,7 +38,7 @@ This repo is the official implementation of our paper: On the Resolution–Perfo
 
 
 ## Introduction
-This work establishes a resolution-aware paradigm for LiDAR–4D radar fusion in roadside perception. Instead of relying on a single sensing configuration, we show that perception performance can be systematically improved by adapting fusion strategies to LiDAR resolution. In particular, 4D radar provides complementary motion cues that effectively compensate for the sparsity of low-resolution LiDAR, enabling comparable or even superior performance to high-resolution LiDAR-only solutions.
+This work introduces a resolution-aware LiDAR–4D radar fusion framework for roadside perception, which systematically decomposes the fusion process into key design dimensions, including voxel-level fusion, backbone selection, middle fusion, and cross-modal query strategies. Based on this framework, we develop DRIFT-Net, a set of resolution-aware fusion models that adapt to varying LiDAR point cloud densities. DRIFT-Net dynamically adjusts model complexity across different resolutions, enabling efficient feature extraction under sparse inputs and more expressive cross-modal interaction under denser conditions.
 <div align="center">
   <img src="assets/general_fusion_framework.jpg" width="100%"/>
 </div>
