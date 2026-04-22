@@ -3,25 +3,44 @@
 
 This repo is the official implementation of our paper: On the Resolution–Performance Tradeoff in LiDAR and 4D Radar Fusion for Roadside Perception as well as the follow-ups. Our code is built upon the codebase of [OpenPCDet](https://github.com/open-mmlab/OpenPCDet).
 
-<p align="center">
-  <img src="assets/mid_fusion_det.png" height="450" alt="DRIFT-M" />
-  <img src="assets/high_only_det.png" height="450" alt="High-resolution LiDAR" />
-</p>
-
-<p align="center">
-  <img src="assets/mAP_FPS.png" height="400"  alt="Accuracy-speed trade-off" />
-  <img src="assets/mAP_cost.png" height="400" alt="Performance-cost trade-off" />
-</p>
-
-<p align="center">
-  <em>
-    Resolution-aware LiDAR-4D radar fusion for efficient roadside perception.
-    (a) Qualitative results of the proposed DRIFT-M model.
-    (b) Comparison with a high-resolution LiDAR-only baseline.
-    (c) Accuracy-speed trade-off.
-    (d) Performance-cost trade-off.
-  </em>
-</p>
+<table align="center" style="width: 100%; border-collapse: collapse;">
+  <tr>
+    <td align="center" style="width: 50%; padding: 8px;">
+      <img src="assets/mid_fusion_det.png"
+           width="420" height="300"
+           style="object-fit: contain;"
+           alt="Mid-resolution LiDAR + 4D radar" />
+      <br/>
+      <em>(a) Mid-resolution LiDAR + 4D radar</em>
+    </td>
+    <td align="center" style="width: 50%; padding: 8px;">
+      <img src="assets/high_only_det.png"
+           width="420" height="300"
+           style="object-fit: contain;"
+           alt="High-resolution LiDAR" />
+      <br/>
+      <em>(b) High-resolution LiDAR</em>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" style="width: 50%; padding: 8px;">
+      <img src="assets/mAP_FPS.png"
+           width="420" height="300"
+           style="object-fit: contain;"
+           alt="Accuracy-speed trade-off" />
+      <br/>
+      <em>(c) Accuracy-speed trade-off</em>
+    </td>
+    <td align="center" style="width: 50%; padding: 8px;">
+      <img src="assets/mAP_cost.png"
+           width="420" height="300"
+           style="object-fit: contain;"
+           alt="Performance-cost trade-off" />
+      <br/>
+      <em>(d) Performance-cost trade-off</em>
+    </td>
+  </tr>
+</table>
 
 
 ## Overview
